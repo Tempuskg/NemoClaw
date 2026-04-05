@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Local inference provider helpers for vLLM and Ollama.
 
 const fs = require("fs");
 const { isWsl } = require("./platform");
@@ -39,7 +41,9 @@ function normalizeOllamaServiceUrl(value) {
 function buildOllamaEndpoint(source, hostUrl, routeUrl = hostUrl, routeCandidates = [routeUrl]) {
   const normalizedHostUrl = normalizeOllamaServiceUrl(hostUrl);
   const normalizedRouteUrl = normalizeOllamaServiceUrl(routeUrl);
-  const normalizedRouteCandidates = unique(routeCandidates.map((candidate) => normalizeOllamaServiceUrl(candidate)));
+  const normalizedRouteCandidates = unique(
+    routeCandidates.map((candidate) => normalizeOllamaServiceUrl(candidate)),
+  );
   if (!normalizedHostUrl || !normalizedRouteUrl) return null;
 
   const host = new URL(normalizedHostUrl);
@@ -56,15 +60,18 @@ function buildOllamaEndpoint(source, hostUrl, routeUrl = hostUrl, routeCandidate
     displayTarget,
     hostUrl: normalizedHostUrl,
     routeUrl: normalizedRouteCandidates[0] || normalizedRouteUrl,
-    routeCandidates: normalizedRouteCandidates.length > 0 ? normalizedRouteCandidates : [normalizedRouteUrl],
+    routeCandidates:
+      normalizedRouteCandidates.length > 0 ? normalizedRouteCandidates : [normalizedRouteUrl],
     tagsUrl: `${normalizedHostUrl}/api/tags`,
     generateUrl: `${normalizedHostUrl}/api/generate`,
-    openaiBaseUrl: `${(normalizedRouteCandidates[0] || normalizedRouteUrl)}/v1`,
+    openaiBaseUrl: `${normalizedRouteCandidates[0] || normalizedRouteUrl}/v1`,
   };
 }
 
 function getOllamaRouteCandidates(endpoint) {
-  return unique(endpoint?.routeCandidates?.length ? endpoint.routeCandidates : [endpoint?.routeUrl]);
+  return unique(
+    endpoint?.routeCandidates?.length ? endpoint.routeCandidates : [endpoint?.routeUrl],
+  );
 }
 
 function withResolvedOllamaRoute(endpoint, routeUrl) {
@@ -110,12 +117,14 @@ function getOllamaOverrideEndpoint(opts = {}) {
 
 function getWslHostCandidates(opts = {}) {
   const env = opts.env ?? process.env;
-  if (!isWsl({
-    platform: opts.platform,
-    env,
-    release: opts.release,
-    procVersion: opts.procVersion,
-  })) {
+  if (
+    !isWsl({
+      platform: opts.platform,
+      env,
+      release: opts.release,
+      procVersion: opts.procVersion,
+    })
+  ) {
     return [];
   }
 
@@ -135,10 +144,7 @@ function getWslHostCandidates(opts = {}) {
         ? opts.runCapture("ip route show default 2>/dev/null", { ignoreError: true })
         : "";
 
-  return unique([
-    ...parseResolvConfNameservers(resolvConf),
-    parseDefaultGateway(routeOutput),
-  ]);
+  return unique([...parseResolvConfNameservers(resolvConf), parseDefaultGateway(routeOutput)]);
 }
 
 function getOllamaEndpointCandidates(opts = {}) {
@@ -154,12 +160,11 @@ function getOllamaEndpointCandidates(opts = {}) {
 
   for (const address of getWslHostCandidates(opts)) {
     const hostUrl = `http://${address}:11434`;
-    const endpoint = buildOllamaEndpoint(
-      "wsl-host",
-      hostUrl,
+    const endpoint = buildOllamaEndpoint("wsl-host", hostUrl, DOCKER_DESKTOP_HOST_URL, [
       DOCKER_DESKTOP_HOST_URL,
-      [DOCKER_DESKTOP_HOST_URL, DOCKER_DESKTOP_GATEWAY_URL, hostUrl],
-    );
+      DOCKER_DESKTOP_GATEWAY_URL,
+      hostUrl,
+    ]);
     if (endpoint) {
       candidates.push(endpoint);
     }
@@ -233,7 +238,8 @@ function getLocalProviderContainerReachabilityCheck(provider, opts = {}) {
       return `docker run --rm --add-host host.openshell.internal:host-gateway ${CONTAINER_REACHABILITY_IMAGE} -sf http://host.openshell.internal:8000/v1/models 2>/dev/null`;
     case "ollama-local": {
       const endpoint = opts.endpoint || resolveOllamaEndpoint(opts.runCapture, opts);
-      const routeUrl = opts.routeUrl || getOllamaRouteCandidates(endpoint)[0] || `${HOST_GATEWAY_URL}:11434`;
+      const routeUrl =
+        opts.routeUrl || getOllamaRouteCandidates(endpoint)[0] || `${HOST_GATEWAY_URL}:11434`;
       const tagsUrl = `${routeUrl}/api/tags`;
       return `docker run --rm --add-host host.openshell.internal:host-gateway ${CONTAINER_REACHABILITY_IMAGE} -sf ${tagsUrl} 2>/dev/null`;
     }
@@ -248,7 +254,10 @@ function resolveOllamaContainerRoute(endpoint, runCapture) {
   }
 
   for (const routeUrl of getOllamaRouteCandidates(endpoint)) {
-    const command = getLocalProviderContainerReachabilityCheck("ollama-local", { endpoint, routeUrl });
+    const command = getLocalProviderContainerReachabilityCheck("ollama-local", {
+      endpoint,
+      routeUrl,
+    });
     const output = runCapture(command, { ignoreError: true });
     if (output) {
       return withResolvedOllamaRoute(endpoint, routeUrl);
@@ -258,17 +267,21 @@ function resolveOllamaContainerRoute(endpoint, runCapture) {
   return null;
 }
 
+// eslint-disable-next-line complexity
 function validateLocalProvider(provider, runCapture, opts = {}) {
   const endpoint =
-    provider === "ollama-local" ? opts.endpoint || resolveOllamaEndpoint(runCapture, opts) : opts.endpoint || null;
+    provider === "ollama-local"
+      ? opts.endpoint || resolveOllamaEndpoint(runCapture, opts)
+      : opts.endpoint || null;
   const command = getLocalProviderHealthCheck(provider, { ...opts, runCapture, endpoint });
   if (!command) {
     return { ok: true };
   }
 
-  const output = provider === "ollama-local" && endpoint && !opts.endpoint
-    ? "resolved"
-    : runCapture(command, { ignoreError: true });
+  const output =
+    provider === "ollama-local" && endpoint && !opts.endpoint
+      ? "resolved"
+      : runCapture(command, { ignoreError: true });
   if (!output) {
     switch (provider) {
       case "vllm-local":
@@ -290,15 +303,18 @@ function validateLocalProvider(provider, runCapture, opts = {}) {
     }
   }
 
-  const resolvedEndpoint = provider === "ollama-local"
-    ? resolveOllamaContainerRoute(endpoint, runCapture)
-    : null;
+  const resolvedEndpoint =
+    provider === "ollama-local" ? resolveOllamaContainerRoute(endpoint, runCapture) : null;
   if (provider === "ollama-local") {
     if (resolvedEndpoint) {
       return opts.returnEndpoint ? { ok: true, endpoint: resolvedEndpoint } : { ok: true };
     }
   } else {
-    const containerCommand = getLocalProviderContainerReachabilityCheck(provider, { ...opts, runCapture, endpoint });
+    const containerCommand = getLocalProviderContainerReachabilityCheck(provider, {
+      ...opts,
+      runCapture,
+      endpoint,
+    });
     if (!containerCommand) {
       return { ok: true };
     }
@@ -326,7 +342,10 @@ function validateLocalProvider(provider, runCapture, opts = {}) {
       return { ok: false, message };
     }
     default:
-      return { ok: false, message: "The selected local inference provider is unavailable from containers." };
+      return {
+        ok: false,
+        message: "The selected local inference provider is unavailable from containers.",
+      };
   }
 }
 
@@ -346,9 +365,7 @@ function parseOllamaTagsResponse(output) {
     if (!Array.isArray(parsed?.models)) {
       return [];
     }
-    return parsed.models
-      .map((entry) => entry?.name)
-      .filter(Boolean);
+    return parsed.models.map((entry) => entry?.name).filter(Boolean);
   } catch {
     return [];
   }
@@ -361,7 +378,9 @@ function parseOllamaPsResponse(output, model) {
       return null;
     }
 
-    const entry = parsed.models.find((candidate) => candidate?.name === model || candidate?.model === model);
+    const entry = parsed.models.find(
+      (candidate) => candidate?.name === model || candidate?.model === model,
+    );
     const contextLength = Number(entry?.context_length);
     return Number.isFinite(contextLength) && contextLength > 0 ? contextLength : null;
   } catch {
@@ -383,8 +402,7 @@ function parseOllamaShowResponse(output) {
   try {
     const parsed = JSON.parse(String(output || ""));
     const configuredContext =
-      parseOllamaNumCtx(parsed?.parameters) ||
-      parseOllamaNumCtx(parsed?.modelfile);
+      parseOllamaNumCtx(parsed?.parameters) || parseOllamaNumCtx(parsed?.modelfile);
     if (configuredContext) {
       return configuredContext;
     }
@@ -449,13 +467,14 @@ function validateOllamaOpenClawCompatibility(model, metadata = {}) {
 }
 
 function getOllamaModelOptions(runCapture, opts = {}) {
+  const optionBag = typeof opts === "object" && opts !== null ? opts : {};
   const output = runCapture("ollama list 2>/dev/null", { ignoreError: true });
   const parsed = parseOllamaList(output);
   if (parsed.length > 0) {
     return parsed;
   }
 
-  const endpoint = opts.endpoint || resolveOllamaEndpoint(runCapture, opts);
+  const endpoint = optionBag.endpoint || resolveOllamaEndpoint(runCapture, optionBag);
   if (endpoint) {
     const tags = runCapture(`curl -sf ${endpoint.tagsUrl} 2>/dev/null`, { ignoreError: true });
     const apiParsed = parseOllamaTagsResponse(tags);
@@ -472,6 +491,10 @@ function getDefaultOllamaModel(runCapture, opts = {}) {
   return models.includes(DEFAULT_OLLAMA_MODEL) ? DEFAULT_OLLAMA_MODEL : models[0];
 }
 
+function getInstalledOllamaModels(runCapture) {
+  return parseOllamaList(runCapture("ollama list 2>/dev/null", { ignoreError: true }));
+}
+
 function getBootstrapOllamaModelOptions(gpu) {
   const options = [SMALL_OLLAMA_MODEL];
   if (gpu && gpu.totalMemoryMB >= LARGE_OLLAMA_MIN_MEMORY_MB) {
@@ -481,7 +504,9 @@ function getBootstrapOllamaModelOptions(gpu) {
 }
 
 function getOllamaWarmupCommand(model, opts = {}) {
-  const optionBag = /** @type {Record<string, any>} */ (typeof opts === "object" && opts !== null ? opts : {});
+  const optionBag = /** @type {Record<string, any>} */ (
+    typeof opts === "object" && opts !== null ? opts : {}
+  );
   const keepAlive = typeof opts === "string" ? opts : optionBag.keepAlive || "15m";
   const endpoint = optionBag.endpoint || null;
   const payload = JSON.stringify({
@@ -495,7 +520,9 @@ function getOllamaWarmupCommand(model, opts = {}) {
 }
 
 function getOllamaProbeCommand(model, opts = {}) {
-  const optionBag = /** @type {Record<string, any>} */ (typeof opts === "object" && opts !== null ? opts : {});
+  const optionBag = /** @type {Record<string, any>} */ (
+    typeof opts === "object" && opts !== null ? opts : {}
+  );
   const timeoutSeconds = typeof opts === "number" ? opts : optionBag.timeoutSeconds || 120;
   const keepAlive = optionBag.keepAlive || "15m";
   const endpoint = optionBag.endpoint || null;
@@ -543,6 +570,7 @@ module.exports = {
   OPENCLAW_MIN_CONTEXT_WINDOW,
   getDefaultOllamaModel,
   getBootstrapOllamaModelOptions,
+  getInstalledOllamaModels,
   getLocalProviderBaseUrl,
   getLocalProviderValidationBaseUrl,
   getLocalProviderContainerReachabilityCheck,

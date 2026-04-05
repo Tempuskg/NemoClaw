@@ -2,7 +2,9 @@
 title:
   page: "Monitor NemoClaw Sandbox Activity and Debug Issues"
   nav: "Monitor Sandbox Activity"
-description: "Inspect sandbox health, trace agent behavior, and diagnose problems."
+description:
+  main: "Inspect sandbox health, trace agent behavior, and diagnose problems."
+  agent: "Inspects sandbox health, traces agent behavior, and diagnoses problems. Use when monitoring a running sandbox, debugging agent issues, or checking sandbox logs."
 keywords: ["monitor nemoclaw sandbox", "debug nemoclaw agent issues"]
 topics: ["generative_ai", "ai_agents"]
 tags: ["openclaw", "openshell", "monitoring", "troubleshooting", "nemoclaw"]
@@ -41,7 +43,8 @@ Key fields in the output include the following:
 - Blueprint run ID, which is the identifier for the most recent blueprint execution.
 - Inference provider, which shows the active provider, model, and endpoint.
 
-Run `nemoclaw <name> status` on the host to check sandbox state. Use `openshell sandbox list` for the underlying sandbox details.
+Run `nemoclaw <name> status` on the host to check sandbox state.
+Use `openshell sandbox list` for the underlying sandbox details.
 
 ## View Blueprint and Sandbox Logs
 
@@ -54,7 +57,7 @@ $ nemoclaw <name> logs
 To follow the log output in real time:
 
 ```console
-$ nemoclaw <name> logs -f
+$ nemoclaw <name> logs --follow
 ```
 
 ## Monitor Network Activity in the TUI
@@ -98,9 +101,10 @@ This checks the same managed inference path that OpenClaw uses. It is more relia
 If the request fails, check the following:
 
 1. Run `nemoclaw <name> status` to confirm the active provider and endpoint.
-2. Run `nemoclaw <name> logs -f` to view error messages from the blueprint runner.
-3. If you use Local Ollama, check the Ollama host logs for prompt truncation, load failures, or timeouts.
-4. If a Local Ollama request times out in the TUI or CLI, retry with a fresh session ID so you do not reuse an oversized conversation history.
+2. Run `nemoclaw <name> logs --follow` to view error messages from the blueprint runner.
+3. Verify that the inference endpoint is reachable from the host.
+4. If you use Local Ollama, check the Ollama host logs for prompt truncation, load failures, or timeouts.
+5. If a Local Ollama request times out in the TUI or CLI, retry with a fresh session ID so you do not reuse an oversized conversation history.
 
 ## Related Topics
 

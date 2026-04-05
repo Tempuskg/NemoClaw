@@ -20,6 +20,7 @@ const https = require("https");
 const { spawn, spawnSync } = require("child_process");
 const { resolveOpenshell } = require("../bin/lib/resolve-openshell");
 const { shellQuote, validateName } = require("../bin/lib/runner");
+const { parseAllowedChatIds, isChatAllowed } = require("../bin/lib/chat-filter");
 
 const TELEGRAM_TOOL_FALSE_NEGATIVE_PATTERN = /trouble sending messages via the openclaw telegram tool/i;
 const STDERR_NOISE_PATTERNS = [
@@ -39,15 +40,17 @@ const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const API_KEY = process.env.NVIDIA_API_KEY;
 const SANDBOX = process.env.SANDBOX_NAME || "nemoclaw";
 try { validateName(SANDBOX, "SANDBOX_NAME"); } catch (e) { console.error(e.message); process.exit(1); }
-const ALLOWED_CHATS = process.env.ALLOWED_CHAT_IDS
-  ? process.env.ALLOWED_CHAT_IDS.split(",").map((s) => s.trim())
-  : null;
+const ALLOWED_CHATS = parseAllowedChatIds(process.env.ALLOWED_CHAT_IDS);
 
 if (!TOKEN) { console.error("TELEGRAM_BOT_TOKEN required"); process.exit(1); }
 if (!API_KEY) { console.error("NVIDIA_API_KEY required"); process.exit(1); }
 
 let offset = 0;
 const activeSessions = new Map(); // chatId → message history
+
+const COOLDOWN_MS = 5000;
+const lastMessageTime = new Map();
+const busyChats = new Set();
 
 // ── Telegram API helpers ──────────────────────────────────────────
 
@@ -249,7 +252,7 @@ async function poll() {
         const chatId = String(msg.chat.id);
 
         // Access control
-        if (ALLOWED_CHATS && !ALLOWED_CHATS.includes(chatId)) {
+        if (!isChatAllowed(ALLOWED_CHATS, chatId)) {
           console.log(`[ignored] chat ${chatId} not in allowed list`);
           continue;
         }
@@ -277,6 +280,24 @@ async function poll() {
           continue;
         }
 
+        // Rate limiting: per-chat cooldown
+        const now = Date.now();
+        const lastTime = lastMessageTime.get(chatId) || 0;
+        if (now - lastTime < COOLDOWN_MS) {
+          const wait = Math.ceil((COOLDOWN_MS - (now - lastTime)) / 1000);
+          await sendMessage(chatId, `Please wait ${wait}s before sending another message.`, msg.message_id);
+          continue;
+        }
+
+        // Per-chat serialization: reject if this chat already has an active session
+        if (busyChats.has(chatId)) {
+          await sendMessage(chatId, "Still processing your previous message.", msg.message_id);
+          continue;
+        }
+
+        lastMessageTime.set(chatId, now);
+        busyChats.add(chatId);
+
         // Send typing indicator
         await sendTyping(chatId);
 
@@ -295,6 +316,8 @@ async function poll() {
         } catch (err) {
           clearInterval(typingInterval);
           await sendMessage(chatId, `Error: ${err.message}`, msg.message_id);
+        } finally {
+          busyChats.delete(chatId);
         }
       }
     }
@@ -302,8 +325,8 @@ async function poll() {
     console.error("Poll error:", err.message);
   }
 
-  // Continue polling
-  setTimeout(poll, 100);
+  // Continue polling (1s floor prevents tight-loop resource waste)
+  setTimeout(poll, 1000);
 }
 
 // ── Main ──────────────────────────────────────────────────────────

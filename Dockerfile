@@ -43,7 +43,7 @@ RUN mkdir -p /sandbox/.nemoclaw/blueprints/0.1.0 \
 
 # Copy startup script
 COPY scripts/nemoclaw-start.sh /usr/local/bin/nemoclaw-start
-RUN chmod +x /usr/local/bin/nemoclaw-start
+RUN chmod 755 /usr/local/bin/nemoclaw-start
 
 # Build args for config that varies per deployment.
 # nemoclaw onboard passes these at image build time.
@@ -54,6 +54,10 @@ ARG CHAT_UI_URL=http://127.0.0.1:18789
 ARG NEMOCLAW_INFERENCE_BASE_URL=https://inference.local/v1
 ARG NEMOCLAW_INFERENCE_API=openai-completions
 ARG NEMOCLAW_INFERENCE_COMPAT_B64=e30=
+ARG NEMOCLAW_WEB_CONFIG_B64=e30=
+# Set to "1" to disable device-pairing auth (development/headless only).
+# Default: "0" (device auth enabled — secure by default).
+ARG NEMOCLAW_DISABLE_DEVICE_AUTH=0
 # Unique per build to ensure each image gets a fresh auth token.
 # Pass --build-arg NEMOCLAW_BUILD_ID=$(date +%s) to bust the cache.
 ARG NEMOCLAW_BUILD_ID=default
@@ -67,7 +71,9 @@ ENV NEMOCLAW_MODEL=${NEMOCLAW_MODEL} \
     CHAT_UI_URL=${CHAT_UI_URL} \
     NEMOCLAW_INFERENCE_BASE_URL=${NEMOCLAW_INFERENCE_BASE_URL} \
     NEMOCLAW_INFERENCE_API=${NEMOCLAW_INFERENCE_API} \
-    NEMOCLAW_INFERENCE_COMPAT_B64=${NEMOCLAW_INFERENCE_COMPAT_B64}
+    NEMOCLAW_INFERENCE_COMPAT_B64=${NEMOCLAW_INFERENCE_COMPAT_B64} \
+    NEMOCLAW_WEB_CONFIG_B64=${NEMOCLAW_WEB_CONFIG_B64} \
+    NEMOCLAW_DISABLE_DEVICE_AUTH=${NEMOCLAW_DISABLE_DEVICE_AUTH}
 
 WORKDIR /sandbox
 USER sandbox
@@ -87,10 +93,13 @@ primary_model_ref = os.environ['NEMOCLAW_PRIMARY_MODEL_REF']; \
 inference_base_url = os.environ['NEMOCLAW_INFERENCE_BASE_URL']; \
 inference_api = os.environ['NEMOCLAW_INFERENCE_API']; \
 inference_compat = json.loads(base64.b64decode(os.environ['NEMOCLAW_INFERENCE_COMPAT_B64']).decode('utf-8')); \
+web_config = json.loads(base64.b64decode(os.environ.get('NEMOCLAW_WEB_CONFIG_B64', 'e30=') or 'e30=').decode('utf-8')); \
 parsed = urlparse(chat_ui_url); \
 chat_origin = f'{parsed.scheme}://{parsed.netloc}' if parsed.scheme and parsed.netloc else 'http://127.0.0.1:18789'; \
 origins = ['http://127.0.0.1:18789']; \
 origins = list(dict.fromkeys(origins + [chat_origin])); \
+disable_device_auth = os.environ.get('NEMOCLAW_DISABLE_DEVICE_AUTH', '') == '1'; \
+allow_insecure = parsed.scheme == 'http'; \
 providers = { \
     provider_key: { \
         'baseUrl': inference_base_url, \
@@ -106,14 +115,28 @@ config = { \
     'gateway': { \
         'mode': 'local', \
         'controlUi': { \
-            'allowInsecureAuth': True, \
-            'dangerouslyDisableDeviceAuth': True, \
+            'allowInsecureAuth': allow_insecure, \
+            'dangerouslyDisableDeviceAuth': disable_device_auth, \
             'allowedOrigins': origins, \
         }, \
         'trustedProxies': ['127.0.0.1', '::1'], \
         'auth': {'token': secrets.token_hex(32)} \
     } \
 }; \
+config.update({ \
+    'tools': { \
+        'web': { \
+            'search': { \
+                'enabled': True, \
+                'provider': 'brave', \
+                **({'apiKey': web_config.get('apiKey', '')} if web_config.get('apiKey', '') else {}) \
+            }, \
+            'fetch': { \
+                'enabled': bool(web_config.get('fetchEnabled', True)) \
+            } \
+        } \
+    } \
+} if web_config.get('provider') == 'brave' else {}); \
 path = os.path.expanduser('~/.openclaw/openclaw.json'); \
 json.dump(config, open(path, 'w'), indent=2); \
 os.chmod(path, 0o600)"

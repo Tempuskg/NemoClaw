@@ -9,100 +9,178 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
-const { ROOT, SCRIPTS, run, runCapture, shellQuote } = require("./runner");
+const pRetry = require("p-retry");
+
+/** Parse a numeric env var, returning `fallback` when unset or non-finite. */
+function envInt(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.max(0, Math.round(n)) : fallback;
+}
+const { ROOT, SCRIPTS, redact, run, runCapture, shellQuote } = require("./runner");
 const {
   getDefaultOllamaModel,
+  getBootstrapOllamaModelOptions,
+  getInstalledOllamaModels,
   getLocalProviderBaseUrl,
-  getOllamaModelMetadata,
-  resolveOllamaContainerRoute,
-  resolveOllamaEndpoint,
+  getLocalProviderValidationBaseUrl,
+  getOllamaWarmupCommand,
   validateOllamaModel,
-  validateOllamaOpenClawCompatibility,
   validateLocalProvider,
-  DEFAULT_OLLAMA_MODEL,
 } = require("./local-inference");
-// Terminal color helpers for notes
-const DIM = "\x1b[2m";
-const RESET = "\x1b[0m";
 const {
   CLOUD_MODEL_OPTIONS,
   DEFAULT_CLOUD_MODEL,
-  getOpenClawPrimaryModel,
   getProviderSelectionConfig,
+  parseGatewayInference,
 } = require("./inference-config");
-const {
-  inferContainerRuntime,
-  isUnsupportedMacosRuntime,
-  shouldPatchCoredns,
-} = require("./platform");
+const { inferContainerRuntime, isWsl, shouldPatchCoredns } = require("./platform");
 const { resolveOpenshell } = require("./resolve-openshell");
-const { prompt, ensureApiKey, getCredential, saveCredential } = require("./credentials");
+const {
+  prompt,
+  ensureApiKey,
+  getCredential,
+  normalizeCredentialValue,
+  saveCredential,
+} = require("./credentials");
 const registry = require("./registry");
 const nim = require("./nim");
-const _onboardSession = require("./onboard-session");
+const onboardSession = require("./onboard-session");
 const policies = require("./policies");
-const { checkPortAvailable } = require("./preflight");
-const { getInferenceRuntimeStatus } = require("./inference-status");
+const { ensureUsageNoticeConsent } = require("./usage-notice");
+const {
+  assessHost,
+  checkPortAvailable,
+  ensureSwap,
+  getMemoryInfo,
+  planHostRemediation,
+} = require("./preflight");
+
+// Typed modules (compiled from src/lib/*.ts → dist/lib/*.js)
+const gatewayState = require("../../dist/lib/gateway-state");
+const validation = require("../../dist/lib/validation");
+const urlUtils = require("../../dist/lib/url-utils");
+const buildContext = require("../../dist/lib/build-context");
+const dashboard = require("../../dist/lib/dashboard");
+const webSearch = require("../../dist/lib/web-search");
+
+/**
+ * Create a temp file inside a directory with a cryptographically random name.
+ * Uses fs.mkdtempSync (OS-level mkdtemp) to avoid predictable filenames that
+ * could be exploited via symlink attacks on shared /tmp.
+ * Ref: https://github.com/NVIDIA/NemoClaw/issues/1093
+ */
+function secureTempFile(prefix, ext = "") {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+  return path.join(dir, `${prefix}${ext}`);
+}
+
+/**
+ * Safely remove a mkdtemp-created directory.  Guards against accidentally
+ * deleting the system temp root if a caller passes os.tmpdir() itself.
+ */
+function cleanupTempDir(filePath, expectedPrefix) {
+  const parentDir = path.dirname(filePath);
+  if (parentDir !== os.tmpdir() && path.basename(parentDir).startsWith(`${expectedPrefix}-`)) {
+    fs.rmSync(parentDir, { recursive: true, force: true });
+  }
+}
+
+const EXPERIMENTAL = process.env.NEMOCLAW_EXPERIMENTAL === "1";
+const USE_COLOR = !process.env.NO_COLOR && !!process.stdout.isTTY;
+const DIM = USE_COLOR ? "\x1b[2m" : "";
+const RESET = USE_COLOR ? "\x1b[0m" : "";
+let OPENSHELL_BIN = null;
 const GATEWAY_NAME = "nemoclaw";
-const DEFAULT_MANAGED_CONTEXT_WINDOW = 131072;
-const DEFAULT_MANAGED_MAX_TOKENS = 4096;
-const DEFAULT_OLLAMA_CONTEXT_WINDOW = 4096;
+const BACK_TO_SELECTION = "__NEMOCLAW_BACK_TO_SELECTION__";
+const OPENCLAW_LAUNCH_AGENT_PLIST = "~/Library/LaunchAgents/ai.openclaw.gateway.plist";
 
-function resolveSelectionProviderType(selectionConfig) {
-  if (selectionConfig.provider) {
-    return selectionConfig.provider;
-  }
+const BUILD_ENDPOINT_URL = "https://integrate.api.nvidia.com/v1";
+const OPENAI_ENDPOINT_URL = "https://api.openai.com/v1";
+const ANTHROPIC_ENDPOINT_URL = "https://api.anthropic.com";
+const GEMINI_ENDPOINT_URL = "https://generativelanguage.googleapis.com/v1beta/openai/";
+const BRAVE_SEARCH_HELP_URL = "https://api.search.brave.com/app/keys";
 
-  if (selectionConfig.profile === "inference-local") {
-    return selectionConfig.model === DEFAULT_OLLAMA_MODEL ? "ollama-local" : "nvidia-nim";
-  }
+const REMOTE_PROVIDER_CONFIG = {
+  build: {
+    label: "NVIDIA Endpoints",
+    providerName: "nvidia-prod",
+    providerType: "nvidia",
+    credentialEnv: "NVIDIA_API_KEY",
+    endpointUrl: BUILD_ENDPOINT_URL,
+    helpUrl: "https://build.nvidia.com/settings/api-keys",
+    modelMode: "catalog",
+    defaultModel: DEFAULT_CLOUD_MODEL,
+    skipVerify: true,
+  },
+  openai: {
+    label: "OpenAI",
+    providerName: "openai-api",
+    providerType: "openai",
+    credentialEnv: "OPENAI_API_KEY",
+    endpointUrl: OPENAI_ENDPOINT_URL,
+    helpUrl: "https://platform.openai.com/api-keys",
+    modelMode: "curated",
+    defaultModel: "gpt-5.4",
+    skipVerify: true,
+  },
+  anthropic: {
+    label: "Anthropic",
+    providerName: "anthropic-prod",
+    providerType: "anthropic",
+    credentialEnv: "ANTHROPIC_API_KEY",
+    endpointUrl: ANTHROPIC_ENDPOINT_URL,
+    helpUrl: "https://console.anthropic.com/settings/keys",
+    modelMode: "curated",
+    defaultModel: "claude-sonnet-4-6",
+  },
+  anthropicCompatible: {
+    label: "Other Anthropic-compatible endpoint",
+    providerName: "compatible-anthropic-endpoint",
+    providerType: "anthropic",
+    credentialEnv: "COMPATIBLE_ANTHROPIC_API_KEY",
+    endpointUrl: "",
+    helpUrl: null,
+    modelMode: "input",
+    defaultModel: "",
+  },
+  gemini: {
+    label: "Google Gemini",
+    providerName: "gemini-api",
+    providerType: "openai",
+    credentialEnv: "GEMINI_API_KEY",
+    endpointUrl: GEMINI_ENDPOINT_URL,
+    helpUrl: "https://aistudio.google.com/app/apikey",
+    modelMode: "curated",
+    defaultModel: "gemini-2.5-flash",
+    skipVerify: true,
+  },
+  custom: {
+    label: "Other OpenAI-compatible endpoint",
+    providerName: "compatible-endpoint",
+    providerType: "openai",
+    credentialEnv: "COMPATIBLE_API_KEY",
+    endpointUrl: "",
+    helpUrl: null,
+    modelMode: "input",
+    defaultModel: "",
+    skipVerify: true,
+  },
+};
 
-  if (selectionConfig.endpointType === "vllm") {
-    return "vllm-local";
-  }
-
-  return "nvidia-nim";
-}
-
-function getManagedModelLimits(providerType, selectionConfig = {}) {
-  if (Number.isFinite(selectionConfig.contextWindow) && selectionConfig.contextWindow > 0) {
-    return {
-      contextWindow: selectionConfig.contextWindow,
-      maxTokens:
-        Number.isFinite(selectionConfig.maxTokens) && selectionConfig.maxTokens > 0
-          ? selectionConfig.maxTokens
-          : DEFAULT_MANAGED_MAX_TOKENS,
-    };
-  }
-
-  if (providerType === "ollama-local") {
-    return {
-      contextWindow: DEFAULT_OLLAMA_CONTEXT_WINDOW,
-      maxTokens: DEFAULT_MANAGED_MAX_TOKENS,
-    };
-  }
-
-  return {
-    contextWindow: DEFAULT_MANAGED_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MANAGED_MAX_TOKENS,
-  };
-}
-
-function getOllamaProbeOutcome(model, probe, opts = {}) {
-  if (probe?.ok) {
-    return { fatal: false, message: null };
-  }
-
-  const message = probe?.message || `Selected Ollama model '${model}' failed the local probe.`;
-  if (opts.allowWarmupFailure) {
-    return {
-      fatal: false,
-      message: `${message} Continuing because the inference route is configured and the model may still be loading.`,
-    };
-  }
-
-  return { fatal: true, message };
-}
+const REMOTE_MODEL_OPTIONS = {
+  openai: ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro-2026-03-05"],
+  anthropic: ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-6"],
+  gemini: [
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+  ],
+};
 
 // Non-interactive mode: set by --non-interactive flag or env var.
 // When active, all prompts use env var overrides or sensible defaults.
@@ -130,109 +208,62 @@ async function promptOrDefault(question, envVar, defaultValue) {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/**
- * Check if a sandbox is in Ready state from `openshell sandbox list` output.
- * Strips ANSI codes and exact-matches the sandbox name in the first column.
- */
-function isSandboxReady(output, sandboxName) {
-  // eslint-disable-next-line no-control-regex
-  const clean = output.replace(/\x1b\[[0-9;]*m/g, "");
-  return clean.split("\n").some((l) => {
-    const cols = l.trim().split(/\s+/);
-    return cols[0] === sandboxName && cols.includes("Ready") && !cols.includes("NotReady");
-  });
-}
-
-/**
- * Determine whether stale NemoClaw gateway output indicates a previous
- * session that should be cleaned up before the port preflight check.
- * @param {string} gwInfoOutput - Raw output from `openshell gateway info -g nemoclaw`.
- * @returns {boolean}
- */
-function hasStaleGateway(gwInfoOutput) {
-  const cleanOutput =
-    typeof gwInfoOutput === "string"
-      ? // eslint-disable-next-line no-control-regex
-        gwInfoOutput.replace(/\x1b\[[0-9;]*m/g, "")
-      : "";
-  return (
-    cleanOutput.length > 0 &&
-    cleanOutput.includes(`Gateway: ${GATEWAY_NAME}`) &&
-    !cleanOutput.includes("No gateway metadata found")
-  );
-}
+// Gateway state functions — delegated to src/lib/gateway-state.ts
+const {
+  isSandboxReady,
+  hasStaleGateway,
+  isSelectedGateway,
+  isGatewayHealthy,
+  getGatewayReuseState,
+  getSandboxStateFromOutputs,
+} = gatewayState;
 
 function getReportedGatewayName(output = "") {
+  if (typeof gatewayState.getReportedGatewayName === "function") {
+    return gatewayState.getReportedGatewayName(output);
+  }
   if (typeof output !== "string") return null;
-  // eslint-disable-next-line no-control-regex
-  const cleanOutput = output.replace(/\x1b\[[0-9;]*m/g, "");
-  const match = cleanOutput.match(/^\s*Gateway:\s+([^\s]+)/m);
+  const match = stripAnsiOutput(output).match(/^\s*Gateway:\s+([^\s]+)/m);
   return match ? match[1] : null;
-}
-
-function isGatewayConnected(statusOutput = "") {
-  return typeof statusOutput === "string" && statusOutput.includes("Connected");
-}
-
-function hasActiveGatewayInfo(activeGatewayInfoOutput = "") {
-  return (
-    typeof activeGatewayInfoOutput === "string" &&
-    activeGatewayInfoOutput.includes("Gateway endpoint:") &&
-    !activeGatewayInfoOutput.includes("No gateway metadata found")
-  );
 }
 
 function getReportedGatewayEndpoint(output = "") {
   if (typeof output !== "string") return null;
-  // eslint-disable-next-line no-control-regex
-  const cleanOutput = output.replace(/\x1b\[[0-9;]*m/g, "");
-  const match = cleanOutput.match(/^\s*Gateway endpoint:\s+([^\s]+)/m);
-  return match ? match[1] : null;
+  const match = stripAnsiOutput(output).match(/^\s*Gateway endpoint:\s+(.+)$/m);
+  return match ? match[1].trim() : null;
 }
 
-function isSelectedGateway(statusOutput = "", gatewayName = GATEWAY_NAME) {
-  return getReportedGatewayName(statusOutput) === gatewayName;
+function stripAnsiOutput(output = "") {
+  let result = "";
+  let index = 0;
+
+  while (index < output.length) {
+    if (output[index] === "\u001b" && output[index + 1] === "[") {
+      index += 2;
+      while (index < output.length && output[index] !== "m") {
+        index += 1;
+      }
+      if (index < output.length) {
+        index += 1;
+      }
+      continue;
+    }
+
+    result += output[index];
+    index += 1;
+  }
+
+  return result;
 }
 
-function isGatewayHealthy(statusOutput = "", gwInfoOutput = "", activeGatewayInfoOutput = "") {
-  const namedGatewayKnown = hasStaleGateway(gwInfoOutput);
-  if (!namedGatewayKnown || !isGatewayConnected(statusOutput)) return false;
-
-  const activeGatewayName = getReportedGatewayName(statusOutput) || getReportedGatewayName(activeGatewayInfoOutput);
-  return activeGatewayName === GATEWAY_NAME;
-}
-
-function getGatewayReuseState(statusOutput = "", gwInfoOutput = "", activeGatewayInfoOutput = "") {
-  if (isGatewayHealthy(statusOutput, gwInfoOutput, activeGatewayInfoOutput)) {
-    return "healthy";
+function countListedSandboxes(output = "") {
+  if (typeof output !== "string" || !output.trim() || /No sandboxes found\./i.test(output)) {
+    return 0;
   }
-  const connected = isGatewayConnected(statusOutput);
-  const activeGatewayName = getReportedGatewayName(statusOutput) || getReportedGatewayName(activeGatewayInfoOutput);
-  if (connected && activeGatewayName === GATEWAY_NAME) {
-    return "active-unnamed";
-  }
-  if (connected && activeGatewayName && activeGatewayName !== GATEWAY_NAME) {
-    return "foreign-active";
-  }
-  if (hasStaleGateway(gwInfoOutput)) {
-    return "stale";
-  }
-  if (hasActiveGatewayInfo(activeGatewayInfoOutput)) {
-    return "active-unnamed";
-  }
-  return "missing";
-}
-
-function countListedSandboxes(listOutput = "") {
-  if (typeof listOutput !== "string" || !listOutput.trim()) return 0;
-  // eslint-disable-next-line no-control-regex
-  const cleanOutput = listOutput.replace(/\x1b\[[0-9;]*m/g, "");
-  if (/No sandboxes found\./i.test(cleanOutput)) return 0;
-  return cleanOutput
+  return output
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line && !/^NAME\s+/i.test(line) && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?\s+/.test(line))
-    .length;
+    .filter((line) => line && !/^NAME\s+STATUS\b/i.test(line)).length;
 }
 
 function getGatewayClusterContainerName(gatewayName = GATEWAY_NAME) {
@@ -240,7 +271,7 @@ function getGatewayClusterContainerName(gatewayName = GATEWAY_NAME) {
 }
 
 function listLocalGatewayNames(dockerPsOutput = "") {
-  if (typeof dockerPsOutput !== "string" || !dockerPsOutput.trim()) return [];
+  if (typeof dockerPsOutput !== "string") return [];
   return dockerPsOutput
     .split("\n")
     .map((line) => line.trim())
@@ -249,29 +280,8 @@ function listLocalGatewayNames(dockerPsOutput = "") {
     .filter(Boolean);
 }
 
-function hasLocalGatewayContainer(gatewayName = GATEWAY_NAME, dockerPsOutput = "") {
+function hasLocalGatewayContainer(gatewayName, dockerPsOutput = "") {
   return listLocalGatewayNames(dockerPsOutput).includes(gatewayName);
-}
-
-async function promptForExistingGatewayAction(gatewayName, sandboxCount = 0) {
-  const sandboxHint = sandboxCount > 0 ? ` with ${sandboxCount} sandbox${sandboxCount === 1 ? "" : "es"}` : "";
-  const promptText = `  Found existing OpenShell gateway '${gatewayName}' on port 8080${sandboxHint}. NemoClaw must recreate this local gateway as '${GATEWAY_NAME}' before sandbox image upload can work. Recreate it now or abort? [recreate/abort]: `;
-
-  while (true) {
-    const answer = String(await promptOrDefault(promptText, "NEMOCLAW_EXISTING_GATEWAY_ACTION", "recreate")).trim().toLowerCase();
-    if (answer === "recreate" || answer === "r" || answer === "replace") return "recreate";
-    if (answer === "abort" || answer === "a" || answer === "cancel") return "abort";
-    console.log("  Please answer 'recreate' or 'abort'.");
-    if (isNonInteractive()) {
-      process.exit(1);
-    }
-  }
-}
-
-function getSandboxStateFromOutputs(sandboxName, getOutput = "", listOutput = "") {
-  if (!sandboxName) return "missing";
-  if (!getOutput) return "missing";
-  return isSandboxReady(listOutput, sandboxName) ? "ready" : "not_ready";
 }
 
 function getSandboxReuseState(sandboxName) {
@@ -281,7 +291,7 @@ function getSandboxReuseState(sandboxName) {
   return getSandboxStateFromOutputs(sandboxName, getOutput, listOutput);
 }
 
-function _repairRecordedSandbox(sandboxName) {
+function repairRecordedSandbox(sandboxName) {
   if (!sandboxName) return;
   note(`  [resume] Cleaning up recorded sandbox '${sandboxName}' before recreating it.`);
   runOpenshell(["forward", "stop", "18789"], { ignoreError: true });
@@ -303,12 +313,61 @@ function streamSandboxCreate(command, env = process.env, options = {}) {
   let settled = false;
   let polling = false;
   const pollIntervalMs = options.pollIntervalMs || 2000;
+  const heartbeatIntervalMs = options.heartbeatIntervalMs || 5000;
+  const silentPhaseMs = options.silentPhaseMs || 15000;
+  const startedAt = Date.now();
+  let lastOutputAt = startedAt;
+  let currentPhase = "build";
+  let lastHeartbeatPhase = null;
+  let lastHeartbeatBucket = -1;
+
+  function getDisplayWidth() {
+    return Math.max(60, Number(process.stdout.columns || 100));
+  }
+
+  function trimDisplayLine(line) {
+    const width = getDisplayWidth();
+    const maxLen = Math.max(40, width - 4);
+    if (line.length <= maxLen) return line;
+    return `${line.slice(0, Math.max(0, maxLen - 3))}...`;
+  }
+
+  function printProgressLine(line) {
+    const display = trimDisplayLine(line);
+    if (display !== lastPrintedLine) {
+      console.log(display);
+      lastPrintedLine = display;
+    }
+  }
+
+  function elapsedSeconds() {
+    return Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  }
+
+  function setPhase(nextPhase) {
+    if (!nextPhase || nextPhase === currentPhase) return;
+    currentPhase = nextPhase;
+    lastHeartbeatPhase = null;
+    lastHeartbeatBucket = -1;
+    const phaseLine =
+      nextPhase === "build"
+        ? "  Building sandbox image..."
+        : nextPhase === "upload"
+          ? "  Uploading image into OpenShell gateway..."
+          : nextPhase === "create"
+            ? "  Creating sandbox in gateway..."
+            : nextPhase === "ready"
+              ? "  Waiting for sandbox to become ready..."
+              : null;
+    if (phaseLine) printProgressLine(phaseLine);
+  }
 
   function finish(result) {
     if (settled) return;
     settled = true;
     if (pending) flushLine(pending);
     if (readyTimer) clearInterval(readyTimer);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     resolvePromise(result);
   }
 
@@ -325,6 +384,7 @@ function streamSandboxCreate(command, env = process.env, options = {}) {
   function shouldShowLine(line) {
     return (
       /^ {2}Building image /.test(line) ||
+      /^ {2}Step \d+\/\d+ : /.test(line) ||
       /^ {2}Context: /.test(line) ||
       /^ {2}Gateway: /.test(line) ||
       /^Successfully built /.test(line) ||
@@ -342,9 +402,20 @@ function streamSandboxCreate(command, env = process.env, options = {}) {
     const line = rawLine.replace(/\r/g, "").trimEnd();
     if (!line) return;
     lines.push(line);
+    lastOutputAt = Date.now();
+    if (/^ {2}Building image /.test(line) || /^ {2}Step \d+\/\d+ : /.test(line)) {
+      setPhase("build");
+    } else if (
+      /^ {2}Pushing image /.test(line) ||
+      /^\s*\[progress\]/.test(line) ||
+      /^ {2}Image .*available in the gateway/.test(line)
+    ) {
+      setPhase("upload");
+    } else if (/^Created sandbox: /.test(line)) {
+      setPhase("create");
+    }
     if (shouldShowLine(line) && line !== lastPrintedLine) {
-      console.log(line);
-      lastPrintedLine = line;
+      printProgressLine(line);
       sawProgress = true;
     }
   }
@@ -372,12 +443,10 @@ function streamSandboxCreate(command, env = process.env, options = {}) {
             return;
           }
           if (!ready) return;
+          setPhase("ready");
           const detail = "Sandbox reported Ready before create stream exited; continuing.";
           lines.push(detail);
-          if (detail !== lastPrintedLine) {
-            console.log(`  ${detail}`);
-            lastPrintedLine = detail;
-          }
+          printProgressLine(`  ${detail}`);
           try {
             child.kill("SIGTERM");
           } catch {
@@ -391,6 +460,32 @@ function streamSandboxCreate(command, env = process.env, options = {}) {
       }, pollIntervalMs)
     : null;
   readyTimer?.unref?.();
+
+  setPhase("build");
+  const heartbeatTimer = setInterval(() => {
+    if (settled) return;
+    const silentForMs = Date.now() - lastOutputAt;
+    if (silentForMs < silentPhaseMs) return;
+    const elapsed = elapsedSeconds();
+    const bucket = Math.floor(elapsed / 15);
+    if (currentPhase === lastHeartbeatPhase && bucket === lastHeartbeatBucket) {
+      return;
+    }
+    const heartbeatLine =
+      currentPhase === "upload"
+        ? `  Still uploading image into OpenShell gateway... (${elapsed}s elapsed)`
+        : currentPhase === "create"
+          ? `  Still creating sandbox in gateway... (${elapsed}s elapsed)`
+          : currentPhase === "ready"
+            ? `  Still waiting for sandbox to become ready... (${elapsed}s elapsed)`
+            : `  Still building sandbox image... (${elapsed}s elapsed)`;
+    if (trimDisplayLine(heartbeatLine) !== lastPrintedLine) {
+      printProgressLine(heartbeatLine);
+      lastHeartbeatPhase = currentPhase;
+      lastHeartbeatBucket = bucket;
+    }
+  }, heartbeatIntervalMs);
+  heartbeatTimer.unref?.();
 
   return new Promise((resolve) => {
     resolvePromise = resolve;
@@ -410,402 +505,1436 @@ function streamSandboxCreate(command, env = process.env, options = {}) {
   });
 }
 
+function streamGatewayStart(command, env = process.env) {
+  const child = spawn("bash", ["-lc", command], {
+    cwd: ROOT,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const lines = [];
+  let pending = "";
+  let settled = false;
+  let resolvePromise;
+  let lastPrintedLine = "";
+  let currentPhase = "cluster";
+  let lastHeartbeatBucket = -1;
+  let lastOutputAt = Date.now();
+  const startedAt = Date.now();
+
+  function getDisplayWidth() {
+    return Math.max(60, Number(process.stdout.columns || 100));
+  }
+
+  function trimDisplayLine(line) {
+    const width = getDisplayWidth();
+    const maxLen = Math.max(40, width - 4);
+    if (line.length <= maxLen) return line;
+    return `${line.slice(0, Math.max(0, maxLen - 3))}...`;
+  }
+
+  function printProgressLine(line) {
+    const display = trimDisplayLine(line);
+    if (display !== lastPrintedLine) {
+      console.log(display);
+      lastPrintedLine = display;
+    }
+  }
+
+  function elapsedSeconds() {
+    return Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  }
+
+  function setPhase(nextPhase) {
+    if (!nextPhase || nextPhase === currentPhase) return;
+    currentPhase = nextPhase;
+    const phaseLine =
+      nextPhase === "install"
+        ? "  Installing OpenShell components..."
+        : nextPhase === "pod"
+          ? "  Starting OpenShell gateway pod..."
+          : nextPhase === "health"
+            ? "  Waiting for gateway health..."
+            : "  Starting gateway cluster...";
+    printProgressLine(phaseLine);
+  }
+
+  function classifyLine(line) {
+    if (/ApplyJob|helm-install-openshell|Applying HelmChart/i.test(line)) return "install";
+    if (
+      /openshell-0|Observed pod startup duration|MountVolume\.MountDevice succeeded/i.test(line)
+    ) {
+      return "pod";
+    }
+    if (/Gateway .* ready\.?$/i.test(line)) return "health";
+    return null;
+  }
+
+  function flushLine(rawLine) {
+    const line = rawLine.replace(/\r/g, "").trimEnd();
+    if (!line) return;
+    lines.push(line);
+    lastOutputAt = Date.now();
+    const nextPhase = classifyLine(line);
+    if (nextPhase) setPhase(nextPhase);
+  }
+
+  function onChunk(chunk) {
+    pending += chunk.toString();
+    const parts = pending.split("\n");
+    pending = parts.pop();
+    parts.forEach(flushLine);
+  }
+
+  function finish(result) {
+    if (settled) return;
+    settled = true;
+    if (pending) flushLine(pending);
+    clearInterval(heartbeatTimer);
+    resolvePromise(result);
+  }
+
+  child.stdout.on("data", onChunk);
+  child.stderr.on("data", onChunk);
+
+  printProgressLine("  Starting gateway cluster...");
+  const heartbeatTimer = setInterval(() => {
+    if (settled) return;
+    const elapsed = elapsedSeconds();
+    const bucket = Math.floor(elapsed / 10);
+    if (bucket === lastHeartbeatBucket) return;
+    if (Date.now() - lastOutputAt < 3000 && elapsed < 10) return;
+    const heartbeatLine =
+      currentPhase === "install"
+        ? `  Still installing OpenShell components... (${elapsed}s elapsed)`
+        : currentPhase === "pod"
+          ? `  Still starting OpenShell gateway pod... (${elapsed}s elapsed)`
+          : currentPhase === "health"
+            ? `  Still waiting for gateway health... (${elapsed}s elapsed)`
+            : `  Still starting gateway cluster... (${elapsed}s elapsed)`;
+    printProgressLine(heartbeatLine);
+    lastHeartbeatBucket = bucket;
+  }, 5000);
+  heartbeatTimer.unref?.();
+
+  return new Promise((resolve) => {
+    resolvePromise = resolve;
+    child.on("error", (error) => {
+      const detail = error?.message || String(error);
+      lines.push(detail);
+      finish({ status: 1, output: lines.join("\n") });
+    });
+    child.on("close", (code) => {
+      finish({ status: code ?? 1, output: lines.join("\n") });
+    });
+  });
+}
+
 function step(n, total, msg) {
   console.log("");
   console.log(`  [${n}/${total}] ${msg}`);
   console.log(`  ${"─".repeat(50)}`);
 }
 
-function pythonLiteralJson(value) {
-  return JSON.stringify(JSON.stringify(value));
+function getInstalledOpenshellVersion(versionOutput = null) {
+  const output = String(versionOutput ?? runCapture("openshell -V", { ignoreError: true })).trim();
+  const match = output.match(/openshell\s+([0-9]+\.[0-9]+\.[0-9]+)/i);
+  if (!match) return null;
+  return match[1];
 }
 
-function isWslEnvironment(env = process.env, platform = process.platform, release = os.release()) {
-  if (platform !== "linux") return false;
-  const normalizedRelease = String(release || "").toLowerCase();
-  return Boolean(env.WSL_DISTRO_NAME || env.WSL_INTEROP) || normalizedRelease.includes("microsoft");
+function getStableGatewayImageRef(versionOutput = null) {
+  const version = getInstalledOpenshellVersion(versionOutput);
+  if (!version) return null;
+  return `ghcr.io/nvidia/openshell/cluster:${version}`;
 }
 
-function getWslHostAddress(options = {}) {
-  const {
-    env = process.env,
-    platform = process.platform,
-    release = os.release(),
-    runCapture: runCaptureFn = runCapture,
-  } = options;
-  if (!isWslEnvironment(env, platform, release)) return null;
+function getOpenshellBinary() {
+  if (OPENSHELL_BIN) return OPENSHELL_BIN;
+  const resolved = resolveOpenshell();
+  if (!resolved) {
+    console.error("  openshell CLI not found.");
+    console.error("  Install manually: https://github.com/NVIDIA/OpenShell/releases");
+    process.exit(1);
+  }
+  OPENSHELL_BIN = resolved;
+  return OPENSHELL_BIN;
+}
 
-  const output = runCaptureFn("hostname -I 2>/dev/null", { ignoreError: true });
-  const candidates = String(output || "")
+function openshellShellCommand(args) {
+  return [shellQuote(getOpenshellBinary()), ...args.map((arg) => shellQuote(arg))].join(" ");
+}
+
+function runOpenshell(args, opts = {}) {
+  return run(openshellShellCommand(args), opts);
+}
+
+function runCaptureOpenshell(args, opts = {}) {
+  return runCapture(openshellShellCommand(args), opts);
+}
+
+// URL/string utilities — delegated to src/lib/url-utils.ts
+const {
+  compactText,
+  normalizeProviderBaseUrl,
+  isLoopbackHostname,
+  formatEnvAssignment,
+  parsePolicyPresetEnv,
+} = urlUtils;
+
+function hydrateCredentialEnv(envName) {
+  if (!envName) return null;
+  const value = getCredential(envName);
+  if (value) {
+    process.env[envName] = value;
+  }
+  return value || null;
+}
+
+function getCurlTimingArgs() {
+  return ["--connect-timeout", "10", "--max-time", "60"];
+}
+
+function summarizeCurlFailure(curlStatus = 0, stderr = "", body = "") {
+  const detail = compactText(stderr || body);
+  return detail
+    ? `curl failed (exit ${curlStatus}): ${detail.slice(0, 200)}`
+    : `curl failed (exit ${curlStatus})`;
+}
+
+function summarizeProbeFailure(body = "", status = 0, curlStatus = 0, stderr = "") {
+  if (curlStatus) {
+    return summarizeCurlFailure(curlStatus, stderr, body);
+  }
+  return summarizeProbeError(body, status);
+}
+
+function getNavigationChoice(value = "") {
+  const normalized = String(value || "")
     .trim()
-    .split(/\s+/)
-    .filter((value) => /^\d+\.\d+\.\d+\.\d+$/.test(value));
-  return candidates[0] || null;
+    .toLowerCase();
+  if (normalized === "back") return "back";
+  if (normalized === "exit" || normalized === "quit") return "exit";
+  return null;
 }
 
-function getControlUiAllowedOrigins(options = {}) {
-  const origins = ["http://127.0.0.1:18789", "http://localhost:18789"];
-  const wslHostAddress = getWslHostAddress(options);
-  if (wslHostAddress) {
-    origins.push(`http://${wslHostAddress}:18789`);
+function exitOnboardFromPrompt() {
+  console.log("  Exiting onboarding.");
+  process.exit(1);
+}
+
+function getTransportRecoveryMessage(failure = {}) {
+  const text = compactText(`${failure.message || ""} ${failure.stderr || ""}`).toLowerCase();
+  if (failure.curlStatus === 2 || /option .* is unknown|curl --help|curl --manual/.test(text)) {
+    return "  Validation hit a local curl invocation error. Retry after updating NemoClaw or use a different provider temporarily.";
   }
-  return origins;
-}
-
-function getDashboardForwardPort(options = {}) {
-  return isWslEnvironment(options.env, options.platform, options.release)
-    ? "0.0.0.0:18789"
-    : "18789";
-}
-
-function classifySandboxCreateFailure(output = "") {
-  const text = String(output || "");
-  const uploadedToGateway =
-    /\[progress\]\s+Uploaded to gateway/i.test(text) ||
-    /Image .*available in the gateway/i.test(text);
-
-  if (/failed to read image export stream|Timeout error/i.test(text)) {
-    return {
-      kind: "image_transfer_timeout",
-      uploadedToGateway,
-    };
+  if (failure.httpStatus === 429) {
+    return "  The provider is rate limiting validation requests right now.";
   }
-
-  if (/Connection reset by peer/i.test(text)) {
-    return {
-      kind: "image_transfer_reset",
-      uploadedToGateway,
-    };
+  if (failure.httpStatus >= 500 && failure.httpStatus < 600) {
+    return "  The provider endpoint is reachable but currently failing upstream.";
   }
-
-  if (/Created sandbox:/i.test(text)) {
-    return {
-      kind: "sandbox_create_incomplete",
-      uploadedToGateway: true,
-    };
+  if (failure.curlStatus === 6 || /could not resolve host|name or service not known/.test(text)) {
+    return "  Validation could not resolve the provider hostname. Check DNS, VPN, or the endpoint URL.";
   }
-
-  return {
-    kind: "unknown",
-    uploadedToGateway,
-  };
-}
-
-function printSandboxCreateRecoveryHints(output = "") {
-  const failure = classifySandboxCreateFailure(output);
-  if (failure.kind === "image_transfer_timeout") {
-    console.error("  Hint: image upload into the OpenShell gateway timed out.");
-    console.error("  Recovery: nemoclaw onboard --resume");
-    if (failure.uploadedToGateway) {
-      console.error("  Progress reached the gateway upload stage, so resume may be able to reuse existing gateway state.");
-    }
-    console.error("  If this repeats, check Docker memory and retry on a host with more RAM.");
-    return;
+  if (failure.curlStatus === 7 || /connection refused|failed to connect/.test(text)) {
+    return "  Validation could not connect to the provider endpoint. Check the URL, proxy, or that the service is up.";
   }
-  if (failure.kind === "image_transfer_reset") {
-    console.error("  Hint: the image push/import stream was interrupted.");
-    console.error("  Recovery: nemoclaw onboard --resume");
-    if (failure.uploadedToGateway) {
-      console.error("  The image appears to have reached the gateway before the stream failed.");
-    }
-    console.error("  If this repeats, restart Docker or the gateway and retry.");
-    return;
+  if (failure.curlStatus === 28 || /timed out|timeout/.test(text)) {
+    return "  Validation timed out before the provider replied. Retry, or check network/proxy health.";
   }
-  if (failure.kind === "sandbox_create_incomplete") {
-    console.error("  Hint: sandbox creation started but the create stream did not finish cleanly.");
-    console.error("  Recovery: nemoclaw onboard --resume");
-    console.error("  Check: openshell sandbox list        # verify whether the sandbox became ready");
-    return;
+  if (failure.curlStatus === 35 || failure.curlStatus === 60 || /ssl|tls|certificate/.test(text)) {
+    return "  Validation hit a TLS/certificate error. Check HTTPS trust and whether the endpoint URL is correct.";
   }
-  console.error("  Recovery: nemoclaw onboard --resume");
-  console.error("  Or:      nemoclaw onboard");
+  if (/proxy/.test(text)) {
+    return "  Validation hit a proxy/connectivity error. Check proxy environment settings and endpoint reachability.";
+  }
+  return "  Validation hit a network or transport error.";
 }
 
-function getDashboardForwardStartCommand(sandboxName, options = {}) {
-  return `openshell forward start --background ${getDashboardForwardPort(options)} "${sandboxName}"`;
-}
+// Validation functions — delegated to src/lib/validation.ts
+const {
+  classifyValidationFailure,
+  classifyApplyFailure,
+  classifySandboxCreateFailure,
+  validateNvidiaApiKeyValue,
+  isSafeModelId,
+} = validation;
 
-function buildControlUiConfigSyncScript(controlUiAllowedOrigins = []) {
-  const origins = Array.isArray(controlUiAllowedOrigins)
-    ? controlUiAllowedOrigins.filter((value) => typeof value === "string" && value.trim().length > 0)
-    : [];
-
-  return `
-python3 - <<'PY'
-import json
-import os
-import signal
-
-cfg_path = os.path.expanduser('~/.openclaw/openclaw.json')
-state_dir = os.path.dirname(cfg_path)
-cfg = {}
-if os.path.exists(cfg_path):
-    with open(cfg_path) as f:
-        cfg = json.load(f)
-
-# Ensuring agent directories exist (Fix for missing agents)
-for agent in cfg.get('agents', {}).get('list', []):
-    if not isinstance(agent, dict):
-        continue
-    for key in ('workspace', 'agentDir'):
-        dir_path = agent.get(key, '')
-        if isinstance(dir_path, str) and dir_path.strip():
-            os.makedirs(dir_path.strip(), exist_ok=True)
-
-# Ensure each agent has a webchat session so it appears in the Control UI
-for agent in cfg.get('agents', {}).get('list', []):
-    if not isinstance(agent, dict) or not agent.get('id'):
-        continue
-    agent_id = agent['id']
-    sessions_dir = os.path.join(state_dir, 'agents', agent_id, 'sessions')
-    os.makedirs(sessions_dir, exist_ok=True)
-    store_path = os.path.join(sessions_dir, 'sessions.json')
-    store = {}
-    if os.path.exists(store_path):
-        with open(store_path) as f:
-            store = json.load(f)
-    skey = f'agent:{agent_id}:main'
-    entry = store.get(skey, {})
-    if entry.get('lastChannel') != 'webchat':
-        entry.setdefault('sessionId', f'init-{agent_id}')
-        entry['chatType'] = 'direct'
-        entry['deliveryContext'] = {'channel': 'webchat'}
-        entry['lastChannel'] = 'webchat'
-        entry['origin'] = {'provider': 'webchat', 'surface': 'webchat', 'chatType': 'direct'}
-        store[skey] = entry
-        with open(store_path, 'w') as f:
-            json.dump(store, f)
-        os.chmod(store_path, 0o600)
-
-changed = False
-control_ui_allowed_origins = json.loads(${pythonLiteralJson(origins)})
-if control_ui_allowed_origins:
-    control_ui_cfg = cfg.setdefault('gateway', {}).setdefault('controlUi', {})
-    existing_origins = control_ui_cfg.setdefault('allowedOrigins', [])
-    for origin in control_ui_allowed_origins:
-        if isinstance(origin, str) and origin and origin not in existing_origins:
-            existing_origins.append(origin)
-            changed = True
-
-if changed:
-    with open(cfg_path, 'w') as f:
-        json.dump(cfg, f, indent=2)
-    os.chmod(cfg_path, 0o600)
-
-    for entry in os.listdir('/proc'):
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f'/proc/{entry}/cmdline', 'rb') as f:
-            cmdline = f.read().replace(b'\\x00', b' ').decode('utf-8', 'ignore')
-        except OSError:
-            continue
-        if 'openclaw' in cmdline and 'gateway run' in cmdline:
-            try:
-                os.kill(int(entry), signal.SIGUSR1)
-            except OSError:
-                pass
-            break
-PY
-exit
-`.trim();
-}
-
-function syncSandboxControlUiConfig(sandboxName, options = {}) {
-  const runCaptureFn = options.runCapture || runCapture;
-  const controlUiAllowedOrigins = getControlUiAllowedOrigins(options);
-  const script = buildControlUiConfigSyncScript(controlUiAllowedOrigins);
-  return runCaptureFn(`cat <<'EOF_NEMOCLAW_CONTROL_UI_SYNC' | openshell sandbox connect "${sandboxName}"
-${script}
-EOF_NEMOCLAW_CONTROL_UI_SYNC`, { ignoreError: true });
-}
-
-function buildAuthenticatedDashboardUrl(origin, token) {
-  if (!origin || !token) return null;
-
-  const dashboardUrl = new URL(`${origin}/`);
-  const gatewayUrl = origin.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
-  dashboardUrl.searchParams.set("gatewayUrl", gatewayUrl);
-  dashboardUrl.hash = `token=${encodeURIComponent(token)}`;
-  return dashboardUrl.toString();
-}
-
-function getSandboxGatewayToken(sandboxName, runCaptureFn = runCapture) {
-  const script = `
-python3 - <<'PY'
-import json
-import os
-
-cfg_path = os.path.expanduser('~/.openclaw/openclaw.json')
-token = ''
-if os.path.exists(cfg_path):
-    with open(cfg_path) as f:
-        cfg = json.load(f)
-    token = cfg.get('gateway', {}).get('auth', {}).get('token', '')
-
-print(f'NEMOCLAW_GATEWAY_TOKEN={token}')
-PY
-exit
-`.trim();
-  const output = runCaptureFn(`cat <<'EOF_NEMOCLAW_TOKEN' | openshell sandbox connect "${sandboxName}"
-${script}
-EOF_NEMOCLAW_TOKEN`, { ignoreError: true });
-  const matches = [...String(output || "").matchAll(/NEMOCLAW_GATEWAY_TOKEN=([A-Za-z0-9._-]+)/g)];
-  if (matches.length === 0) return null;
-  return matches[matches.length - 1][1] || null;
-}
-
-function getDashboardAccessInfo(sandboxName, options = {}) {
-  const runCaptureFn = options.runCapture || runCapture;
-  const token = getSandboxGatewayToken(sandboxName, runCaptureFn);
-  const dashboardUrl = buildAuthenticatedDashboardUrl("http://127.0.0.1:18789", token) || "http://127.0.0.1:18789/";
-  const dashboardAccess = [{ label: "Dashboard", url: dashboardUrl }];
-  const allowedOrigins = getControlUiAllowedOrigins({ ...options, runCapture: runCaptureFn });
-  const wslOrigin = allowedOrigins.find(
-    (origin) => origin !== "http://127.0.0.1:18789" && origin !== "http://localhost:18789",
+function getProbeRecovery(probe, options = {}) {
+  const allowModelRetry = options.allowModelRetry === true;
+  const failures = Array.isArray(probe?.failures) ? probe.failures : [];
+  if (failures.length === 0) {
+    return { kind: "unknown", retry: "selection" };
+  }
+  if (failures.some((failure) => classifyValidationFailure(failure).kind === "credential")) {
+    return { kind: "credential", retry: "credential" };
+  }
+  const transportFailure = failures.find(
+    (failure) => classifyValidationFailure(failure).kind === "transport",
   );
-  if (!wslOrigin) return dashboardAccess;
-
-  const authenticatedUrl = buildAuthenticatedDashboardUrl(wslOrigin, token);
-  if (authenticatedUrl) {
-    dashboardAccess.push({ label: "VS Code/WSL", url: authenticatedUrl });
+  if (transportFailure) {
+    return { kind: "transport", retry: "retry", failure: transportFailure };
   }
-
-  return dashboardAccess;
+  if (
+    allowModelRetry &&
+    failures.some((failure) => classifyValidationFailure(failure).kind === "model")
+  ) {
+    return { kind: "model", retry: "model" };
+  }
+  if (failures.some((failure) => classifyValidationFailure(failure).kind === "endpoint")) {
+    return { kind: "endpoint", retry: "selection" };
+  }
+  const fallback = classifyValidationFailure(failures[0]);
+  if (!allowModelRetry && fallback.kind === "model") {
+    return { kind: "unknown", retry: "selection" };
+  }
+  return fallback;
 }
 
-function getDashboardGuidanceLines(dashboardAccess = [], options = {}) {
-  const guidance = [];
-  const isWsl = isWslEnvironment(options.env, options.platform, options.release);
-  const wslAccess = dashboardAccess.find((access) => access && access.label === "VS Code/WSL");
-
-  if (isWsl && wslAccess) {
-    guidance.push("WSL/Win     If Windows cannot load http://127.0.0.1:18789/, use the VS Code/WSL URL above exactly as printed.");
-    guidance.push("WSL path    Use the direct WSL host IP URL above from Windows. Do not replace it with localhost.");
-  }
-
-  return guidance;
-}
-
-function buildSandboxConfigSyncScript(selectionConfig, options = {}) {
-  const providerType = resolveSelectionProviderType(selectionConfig);
-  const modelLimits = getManagedModelLimits(providerType, selectionConfig);
-  const primaryModel = getOpenClawPrimaryModel(providerType, selectionConfig.model);
-  const providerKey = "inference";
-  const runtimeConfigPath = "/tmp/nemoclaw/openclaw.json";
-  const controlUiAllowedOrigins = Array.isArray(options.controlUiAllowedOrigins)
-    ? options.controlUiAllowedOrigins.filter((value) => typeof value === "string" && value.trim().length > 0)
-    : [];
-  const providerConfig = {
-    baseUrl: selectionConfig.endpointUrl,
-    apiKey: "unused",
-    api: "openai-completions",
-    models: [
-      {
-        id: selectionConfig.model,
-        name: selectionConfig.model,
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: modelLimits.contextWindow,
-        maxTokens: modelLimits.maxTokens,
+// eslint-disable-next-line complexity
+function runCurlProbe(argv) {
+  const bodyFile = secureTempFile("nemoclaw-curl-probe", ".json");
+  try {
+    const args = [...argv];
+    const url = args.pop();
+    const result = spawnSync("curl", [...args, "-o", bodyFile, "-w", "%{http_code}", url], {
+      cwd: ROOT,
+      encoding: "utf8",
+      timeout: 30_000,
+      env: {
+        ...process.env,
       },
-    ],
-  };
+    });
+    const body = fs.existsSync(bodyFile) ? fs.readFileSync(bodyFile, "utf8") : "";
+    if (result.error) {
+      const spawnError = /** @type {NodeJS.ErrnoException} */ (result.error);
+      const rawErrorCode = spawnError.errno ?? spawnError.code;
+      const errorCode = typeof rawErrorCode === "number" ? rawErrorCode : 1;
+      const errorMessage = compactText(
+        `${spawnError.message || String(spawnError)} ${String(result.stderr || "")}`,
+      );
+      return {
+        ok: false,
+        httpStatus: 0,
+        curlStatus: errorCode,
+        body,
+        stderr: errorMessage,
+        message: summarizeProbeFailure(body, 0, errorCode, errorMessage),
+      };
+    }
+    const status = Number(String(result.stdout || "").trim());
+    return {
+      ok: result.status === 0 && status >= 200 && status < 300,
+      httpStatus: Number.isFinite(status) ? status : 0,
+      curlStatus: result.status || 0,
+      body,
+      stderr: String(result.stderr || ""),
+      message: summarizeProbeFailure(
+        body,
+        status || 0,
+        result.status || 0,
+        String(result.stderr || ""),
+      ),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      httpStatus: 0,
+      curlStatus: error?.status || 1,
+      body: "",
+      stderr: error?.message || String(error),
+      message: summarizeCurlFailure(error?.status || 1, error?.message || String(error)),
+    };
+  } finally {
+    cleanupTempDir(bodyFile, "nemoclaw-curl-probe");
+  }
+}
+
+// validateNvidiaApiKeyValue — see validation import above
+
+async function replaceNamedCredential(envName, label, helpUrl = null, validator = null) {
+  if (helpUrl) {
+    console.log("");
+    console.log(`  Get your ${label} from: ${helpUrl}`);
+    console.log("");
+  }
+
+  while (true) {
+    const key = normalizeCredentialValue(await prompt(`  ${label}: `, { secret: true }));
+    if (!key) {
+      console.error(`  ${label} is required.`);
+      continue;
+    }
+    const validationError = typeof validator === "function" ? validator(key) : null;
+    if (validationError) {
+      console.error(validationError);
+      continue;
+    }
+    saveCredential(envName, key);
+    process.env[envName] = key;
+    console.log("");
+    console.log(`  Key saved to ~/.nemoclaw/credentials.json (mode 600)`);
+    console.log("");
+    return key;
+  }
+}
+
+async function promptValidationRecovery(label, recovery, credentialEnv = null, helpUrl = null) {
+  if (isNonInteractive()) {
+    process.exit(1);
+  }
+
+  if (recovery.kind === "credential" && credentialEnv) {
+    console.log(
+      `  ${label} authorization failed. Re-enter the API key or choose a different provider/model.`,
+    );
+    const choice = (await prompt("  Type 'retry', 'back', or 'exit' [retry]: "))
+      .trim()
+      .toLowerCase();
+    if (choice === "back") {
+      console.log("  Returning to provider selection.");
+      console.log("");
+      return "selection";
+    }
+    if (choice === "exit" || choice === "quit") {
+      exitOnboardFromPrompt();
+    }
+    if (choice === "" || choice === "retry") {
+      const validator = credentialEnv === "NVIDIA_API_KEY" ? validateNvidiaApiKeyValue : null;
+      await replaceNamedCredential(credentialEnv, `${label} API key`, helpUrl, validator);
+      return "credential";
+    }
+    console.log("  Please choose a provider/model again.");
+    console.log("");
+    return "selection";
+  }
+
+  if (recovery.kind === "transport") {
+    console.log(getTransportRecoveryMessage(recovery.failure || {}));
+    const choice = (await prompt("  Type 'retry', 'back', or 'exit' [retry]: "))
+      .trim()
+      .toLowerCase();
+    if (choice === "back") {
+      console.log("  Returning to provider selection.");
+      console.log("");
+      return "selection";
+    }
+    if (choice === "exit" || choice === "quit") {
+      exitOnboardFromPrompt();
+    }
+    if (choice === "" || choice === "retry") {
+      console.log("");
+      return "retry";
+    }
+    console.log("  Please choose a provider/model again.");
+    console.log("");
+    return "selection";
+  }
+
+  if (recovery.kind === "model") {
+    console.log(`  Please enter a different ${label} model name.`);
+    console.log("");
+    return "model";
+  }
+
+  console.log("  Please choose a provider/model again.");
+  console.log("");
+  return "selection";
+}
+
+function buildProviderArgs(action, name, type, credentialEnv, baseUrl) {
+  const args =
+    action === "create"
+      ? ["provider", "create", "--name", name, "--type", type, "--credential", credentialEnv]
+      : ["provider", "update", name, "--credential", credentialEnv];
+  if (baseUrl && type === "openai") {
+    args.push("--config", `OPENAI_BASE_URL=${baseUrl}`);
+  } else if (baseUrl && type === "anthropic") {
+    args.push("--config", `ANTHROPIC_BASE_URL=${baseUrl}`);
+  }
+  return args;
+}
+
+function upsertProvider(name, type, credentialEnv, baseUrl, env = {}) {
+  const createArgs = buildProviderArgs("create", name, type, credentialEnv, baseUrl);
+  const runOpts = { ignoreError: true, env, stdio: ["ignore", "pipe", "pipe"] };
+  const createResult = runOpenshell(createArgs, runOpts);
+  if (createResult.status === 0) {
+    console.log(`✓ Created provider ${name}`);
+    return { ok: true };
+  }
+
+  const updateArgs = buildProviderArgs("update", name, type, credentialEnv, baseUrl);
+  const updateResult = runOpenshell(updateArgs, runOpts);
+  if (updateResult.status !== 0) {
+    const output =
+      compactText(`${createResult.stderr || ""} ${updateResult.stderr || ""}`) ||
+      compactText(`${createResult.stdout || ""} ${updateResult.stdout || ""}`) ||
+      `Failed to create or update provider '${name}'.`;
+    return {
+      ok: false,
+      status: updateResult.status || createResult.status || 1,
+      message: output,
+    };
+  }
+  console.log(`✓ Updated provider ${name}`);
+  return { ok: true };
+}
+
+function verifyInferenceRoute(_provider, _model) {
+  const output = runCaptureOpenshell(["inference", "get"], { ignoreError: true });
+  if (!output || /Gateway inference:\s*[\r\n]+\s*Not configured/i.test(output)) {
+    console.error("  OpenShell inference route was not configured.");
+    process.exit(1);
+  }
+}
+
+function isInferenceRouteReady(provider, model) {
+  const live = parseGatewayInference(
+    runCaptureOpenshell(["inference", "get"], { ignoreError: true }),
+  );
+  return Boolean(live && live.provider === provider && live.model === model);
+}
+
+function sandboxExistsInGateway(sandboxName) {
+  const output = runCaptureOpenshell(["sandbox", "get", sandboxName], { ignoreError: true });
+  return Boolean(output);
+}
+
+function pruneStaleSandboxEntry(sandboxName) {
+  const existing = registry.getSandbox(sandboxName);
+  const liveExists = sandboxExistsInGateway(sandboxName);
+  if (existing && !liveExists) {
+    registry.removeSandbox(sandboxName);
+  }
+  return liveExists;
+}
+
+function buildSandboxConfigSyncScript(selectionConfig) {
+  // openclaw.json is immutable (root:root 444, Landlock read-only) — never
+  // write to it at runtime.  Model routing is handled by the host-side
+  // gateway (`openshell inference set` in Step 5), not from inside the
+  // sandbox.  We only write the NemoClaw selection config (~/.nemoclaw/).
   return `
-set -eu
+set -euo pipefail
 mkdir -p ~/.nemoclaw
 cat > ~/.nemoclaw/config.json <<'EOF_NEMOCLAW_CFG'
 ${JSON.stringify(selectionConfig, null, 2)}
 EOF_NEMOCLAW_CFG
-python3 - <<'PYCFG'
-import json
-import os
-
-runtime_cfg_path = ${JSON.stringify(runtimeConfigPath)}
-default_cfg_path = os.path.expanduser('~/.openclaw/openclaw.json')
-cfg_path = runtime_cfg_path if os.path.exists(runtime_cfg_path) else default_cfg_path
-source_cfg_path = cfg_path if os.path.exists(cfg_path) else default_cfg_path
-state_dir = os.path.dirname(default_cfg_path)
-cfg = {}
-if os.path.exists(source_cfg_path):
-  with open(source_cfg_path) as f:
-        cfg = json.load(f)
-
-cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = ${JSON.stringify(primaryModel)}
-models_cfg = cfg.setdefault('models', {})
-models_cfg.setdefault('mode', 'merge')
-providers_cfg = models_cfg.setdefault('providers', {})
-providers_cfg[${JSON.stringify(providerKey)}] = json.loads(${pythonLiteralJson(providerConfig)})
-
-control_ui_allowed_origins = json.loads(${pythonLiteralJson(controlUiAllowedOrigins)})
-if control_ui_allowed_origins:
-  control_ui_cfg = cfg.setdefault('gateway', {}).setdefault('controlUi', {})
-  existing_origins = control_ui_cfg.setdefault('allowedOrigins', [])
-  for origin in control_ui_allowed_origins:
-    if isinstance(origin, str) and origin and origin not in existing_origins:
-      existing_origins.append(origin)
-
-wrote_cfg = False
-try:
-  os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
-  with open(cfg_path, 'w') as f:
-    json.dump(cfg, f, indent=2)
-  os.chmod(cfg_path, 0o600)
-  wrote_cfg = True
-except OSError as err:
-  print(f"[nemoclaw] Warning: cannot update {cfg_path}: {err}")
-
-for agent in cfg.get('agents', {}).get('list', []):
-    if not isinstance(agent, dict):
-        continue
-    for key in ('workspace', 'agentDir'):
-        dir_path = agent.get(key, '')
-        if isinstance(dir_path, str) and dir_path.strip():
-            os.makedirs(dir_path.strip(), exist_ok=True)
-
-# Ensure each agent has a webchat session so it appears in the Control UI
-for agent in cfg.get('agents', {}).get('list', []):
-    if not isinstance(agent, dict) or not agent.get('id'):
-        continue
-    agent_id = agent['id']
-    sessions_dir = os.path.join(state_dir, 'agents', agent_id, 'sessions')
-    os.makedirs(sessions_dir, exist_ok=True)
-    store_path = os.path.join(sessions_dir, 'sessions.json')
-    store = {}
-    if os.path.exists(store_path):
-        with open(store_path) as f:
-            store = json.load(f)
-    skey = f'agent:{agent_id}:main'
-    entry = store.get(skey, {})
-    if entry.get('lastChannel') != 'webchat':
-        entry.setdefault('sessionId', f'init-{agent_id}')
-        entry['chatType'] = 'direct'
-        entry['deliveryContext'] = {'channel': 'webchat'}
-        entry['lastChannel'] = 'webchat'
-        entry['origin'] = {'provider': 'webchat', 'surface': 'webchat', 'chatType': 'direct'}
-        store[skey] = entry
-        with open(store_path, 'w') as f:
-          json.dump(store, f)
-        os.chmod(store_path, 0o600)
-PYCFG
-openclaw models set ${shellQuote(primaryModel)} > /dev/null 2>&1 || true
 exit
 `.trim();
 }
 
-function isDockerRunning() {
+function isOpenclawReady(sandboxName) {
+  return Boolean(fetchGatewayAuthTokenFromSandbox(sandboxName));
+}
+
+function writeSandboxConfigSyncFile(script) {
+  const scriptFile = secureTempFile("nemoclaw-sync", ".sh");
+  fs.writeFileSync(scriptFile, `${script}\n`, { mode: 0o600 });
+  return scriptFile;
+}
+
+function encodeDockerJsonArg(value) {
+  return Buffer.from(JSON.stringify(value || {}), "utf8").toString("base64");
+}
+
+function isAffirmativeAnswer(value) {
+  return ["y", "yes"].includes(
+    String(value || "")
+      .trim()
+      .toLowerCase(),
+  );
+}
+
+function printBraveExposureWarning() {
+  console.log("");
+  for (const line of webSearch.getBraveExposureWarningLines()) {
+    console.log(`  ${line}`);
+  }
+  console.log("");
+}
+
+function validateBraveSearchApiKey(apiKey) {
+  return runCurlProbe([
+    "-sS",
+    "--compressed",
+    "-H",
+    "Accept: application/json",
+    "-H",
+    "Accept-Encoding: gzip",
+    "-H",
+    `X-Subscription-Token: ${apiKey}`,
+    "--get",
+    "--data-urlencode",
+    "q=ping",
+    "--data-urlencode",
+    "count=1",
+    "https://api.search.brave.com/res/v1/web/search",
+  ]);
+}
+
+async function promptBraveSearchRecovery(validation) {
+  const recovery = classifyValidationFailure(validation);
+
+  if (recovery.kind === "credential") {
+    console.log("  Brave Search rejected that API key.");
+  } else if (recovery.kind === "transport") {
+    console.log(getTransportRecoveryMessage(validation));
+  } else {
+    console.log("  Brave Search validation did not succeed.");
+  }
+
+  const answer = (await prompt("  Type 'retry', 'skip', or 'exit' [retry]: ")).trim().toLowerCase();
+  if (answer === "skip") return "skip";
+  if (answer === "exit" || answer === "quit") {
+    exitOnboardFromPrompt();
+  }
+  return "retry";
+}
+
+async function promptBraveSearchApiKey() {
+  console.log("");
+  console.log(`  Get your Brave Search API key from: ${BRAVE_SEARCH_HELP_URL}`);
+  console.log("");
+
+  while (true) {
+    const key = normalizeCredentialValue(
+      await prompt("  Brave Search API key: ", { secret: true }),
+    );
+    if (!key) {
+      console.error("  Brave Search API key is required.");
+      continue;
+    }
+    return key;
+  }
+}
+
+async function ensureValidatedBraveSearchCredential() {
+  let apiKey = getCredential(webSearch.BRAVE_API_KEY_ENV);
+  let usingSavedKey = Boolean(apiKey);
+
+  while (true) {
+    if (!apiKey) {
+      apiKey = await promptBraveSearchApiKey();
+      usingSavedKey = false;
+    }
+
+    const validation = validateBraveSearchApiKey(apiKey);
+    if (validation.ok) {
+      saveCredential(webSearch.BRAVE_API_KEY_ENV, apiKey);
+      process.env[webSearch.BRAVE_API_KEY_ENV] = apiKey;
+      return apiKey;
+    }
+
+    const prefix = usingSavedKey
+      ? "  Saved Brave Search API key validation failed."
+      : "  Brave Search API key validation failed.";
+    console.error(prefix);
+    if (validation.message) {
+      console.error(`  ${validation.message}`);
+    }
+
+    const action = await promptBraveSearchRecovery(validation);
+    if (action === "skip") {
+      console.log("  Skipping Brave Web Search setup.");
+      console.log("");
+      return null;
+    }
+
+    apiKey = null;
+    usingSavedKey = false;
+  }
+}
+
+async function configureWebSearch(existingConfig = null) {
+  if (existingConfig) {
+    return { fetchEnabled: true };
+  }
+
+  if (isNonInteractive()) {
+    const braveApiKey = normalizeCredentialValue(process.env[webSearch.BRAVE_API_KEY_ENV]);
+    if (!braveApiKey) {
+      return null;
+    }
+    note("  [non-interactive] Brave Web Search requested.");
+    printBraveExposureWarning();
+    const validation = validateBraveSearchApiKey(braveApiKey);
+    if (!validation.ok) {
+      console.error("  Brave Search API key validation failed.");
+      if (validation.message) {
+        console.error(`  ${validation.message}`);
+      }
+      process.exit(1);
+    }
+    saveCredential(webSearch.BRAVE_API_KEY_ENV, braveApiKey);
+    process.env[webSearch.BRAVE_API_KEY_ENV] = braveApiKey;
+    return { fetchEnabled: true };
+  }
+
+  printBraveExposureWarning();
+  const enableAnswer = await prompt("  Enable Brave Web Search? [y/N]: ");
+  if (!isAffirmativeAnswer(enableAnswer)) {
+    return null;
+  }
+
+  const braveApiKey = await ensureValidatedBraveSearchCredential();
+  if (!braveApiKey) {
+    return null;
+  }
+
+  console.log("  ✓ Enabled Brave Web Search");
+  console.log("");
+  return { fetchEnabled: true };
+}
+
+function getSandboxInferenceConfig(model, provider = null, preferredInferenceApi = null) {
+  let providerKey;
+  let primaryModelRef;
+  let inferenceBaseUrl = "https://inference.local/v1";
+  let inferenceApi = preferredInferenceApi || "openai-completions";
+  let inferenceCompat = null;
+
+  switch (provider) {
+    case "openai-api":
+      providerKey = "openai";
+      primaryModelRef = `openai/${model}`;
+      break;
+    case "anthropic-prod":
+    case "compatible-anthropic-endpoint":
+      providerKey = "anthropic";
+      primaryModelRef = `anthropic/${model}`;
+      inferenceBaseUrl = "https://inference.local";
+      inferenceApi = "anthropic-messages";
+      break;
+    case "gemini-api":
+      providerKey = "inference";
+      primaryModelRef = `inference/${model}`;
+      inferenceCompat = {
+        supportsStore: false,
+      };
+      break;
+    case "compatible-endpoint":
+      providerKey = "inference";
+      primaryModelRef = `inference/${model}`;
+      inferenceCompat = {
+        supportsStore: false,
+      };
+      break;
+    case "nvidia-prod":
+    case "nvidia-nim":
+    default:
+      providerKey = "inference";
+      primaryModelRef = `inference/${model}`;
+      break;
+  }
+
+  return { providerKey, primaryModelRef, inferenceBaseUrl, inferenceApi, inferenceCompat };
+}
+
+function patchStagedDockerfile(
+  dockerfilePath,
+  model,
+  chatUiUrl,
+  buildId = String(Date.now()),
+  provider = null,
+  preferredInferenceApi = null,
+  webSearchConfig = null,
+) {
+  const { providerKey, primaryModelRef, inferenceBaseUrl, inferenceApi, inferenceCompat } =
+    getSandboxInferenceConfig(model, provider, preferredInferenceApi);
+  let dockerfile = fs.readFileSync(dockerfilePath, "utf8");
+  dockerfile = dockerfile.replace(/^ARG NEMOCLAW_MODEL=.*$/m, `ARG NEMOCLAW_MODEL=${model}`);
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_PROVIDER_KEY=.*$/m,
+    `ARG NEMOCLAW_PROVIDER_KEY=${providerKey}`,
+  );
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_PRIMARY_MODEL_REF=.*$/m,
+    `ARG NEMOCLAW_PRIMARY_MODEL_REF=${primaryModelRef}`,
+  );
+  dockerfile = dockerfile.replace(/^ARG CHAT_UI_URL=.*$/m, `ARG CHAT_UI_URL=${chatUiUrl}`);
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_INFERENCE_BASE_URL=.*$/m,
+    `ARG NEMOCLAW_INFERENCE_BASE_URL=${inferenceBaseUrl}`,
+  );
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_INFERENCE_API=.*$/m,
+    `ARG NEMOCLAW_INFERENCE_API=${inferenceApi}`,
+  );
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_INFERENCE_COMPAT_B64=.*$/m,
+    `ARG NEMOCLAW_INFERENCE_COMPAT_B64=${encodeDockerJsonArg(inferenceCompat)}`,
+  );
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_BUILD_ID=.*$/m,
+    `ARG NEMOCLAW_BUILD_ID=${buildId}`,
+  );
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_WEB_CONFIG_B64=.*$/m,
+    `ARG NEMOCLAW_WEB_CONFIG_B64=${webSearch.buildWebSearchDockerConfig(
+      webSearchConfig,
+      webSearchConfig ? getCredential(webSearch.BRAVE_API_KEY_ENV) : null,
+    )}`,
+  );
+  // Onboard flow expects immediate dashboard access without device pairing,
+  // so disable device auth for images built during onboard (see #1217).
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_DISABLE_DEVICE_AUTH=.*$/m,
+    `ARG NEMOCLAW_DISABLE_DEVICE_AUTH=1`,
+  );
+  fs.writeFileSync(dockerfilePath, dockerfile);
+}
+
+function summarizeProbeError(body, status) {
+  if (!body) return `HTTP ${status} with no response body`;
   try {
-    runCapture("docker info", { ignoreError: false });
-    return true;
+    const parsed = JSON.parse(body);
+    const message =
+      parsed?.error?.message ||
+      parsed?.error?.details ||
+      parsed?.message ||
+      parsed?.detail ||
+      parsed?.details;
+    if (message) return `HTTP ${status}: ${String(message)}`;
   } catch {
+    /* non-JSON body — fall through to raw text */
+  }
+  const compact = String(body).replace(/\s+/g, " ").trim();
+  return `HTTP ${status}: ${compact.slice(0, 200)}`;
+}
+
+function probeOpenAiLikeEndpoint(endpointUrl, model, apiKey) {
+  const probes = [
+    {
+      name: "Responses API",
+      api: "openai-responses",
+      url: `${String(endpointUrl).replace(/\/+$/, "")}/responses`,
+      body: JSON.stringify({
+        model,
+        input: "Reply with exactly: OK",
+      }),
+    },
+    {
+      name: "Chat Completions API",
+      api: "openai-completions",
+      url: `${String(endpointUrl).replace(/\/+$/, "")}/chat/completions`,
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "Reply with exactly: OK" }],
+      }),
+    },
+  ];
+
+  const failures = [];
+  for (const probe of probes) {
+    const result = runCurlProbe([
+      "-sS",
+      ...getCurlTimingArgs(),
+      "-H",
+      "Content-Type: application/json",
+      ...(apiKey ? ["-H", `Authorization: Bearer ${normalizeCredentialValue(apiKey)}`] : []),
+      "-d",
+      probe.body,
+      probe.url,
+    ]);
+    if (result.ok) {
+      return { ok: true, api: probe.api, label: probe.name };
+    }
+    failures.push({
+      name: probe.name,
+      httpStatus: result.httpStatus,
+      curlStatus: result.curlStatus,
+      message: result.message,
+    });
+  }
+
+  return {
+    ok: false,
+    message: failures.map((failure) => `${failure.name}: ${failure.message}`).join(" | "),
+    failures,
+  };
+}
+
+function probeAnthropicEndpoint(endpointUrl, model, apiKey) {
+  const result = runCurlProbe([
+    "-sS",
+    ...getCurlTimingArgs(),
+    "-H",
+    `x-api-key: ${normalizeCredentialValue(apiKey)}`,
+    "-H",
+    "anthropic-version: 2023-06-01",
+    "-H",
+    "content-type: application/json",
+    "-d",
+    JSON.stringify({
+      model,
+      max_tokens: 16,
+      messages: [{ role: "user", content: "Reply with exactly: OK" }],
+    }),
+    `${String(endpointUrl).replace(/\/+$/, "")}/v1/messages`,
+  ]);
+  if (result.ok) {
+    return { ok: true, api: "anthropic-messages", label: "Anthropic Messages API" };
+  }
+  return {
+    ok: false,
+    message: result.message,
+    failures: [
+      {
+        name: "Anthropic Messages API",
+        httpStatus: result.httpStatus,
+        curlStatus: result.curlStatus,
+        message: result.message,
+      },
+    ],
+  };
+}
+
+async function validateOpenAiLikeSelection(
+  label,
+  endpointUrl,
+  model,
+  credentialEnv = null,
+  retryMessage = "Please choose a provider/model again.",
+  helpUrl = null,
+) {
+  const apiKey = credentialEnv ? getCredential(credentialEnv) : "";
+  const probe = probeOpenAiLikeEndpoint(endpointUrl, model, apiKey);
+  if (!probe.ok) {
+    console.error(`  ${label} endpoint validation failed.`);
+    console.error(`  ${probe.message}`);
+    if (isNonInteractive()) {
+      process.exit(1);
+    }
+    const retry = await promptValidationRecovery(
+      label,
+      getProbeRecovery(probe),
+      credentialEnv,
+      helpUrl,
+    );
+    if (retry === "selection") {
+      console.log(`  ${retryMessage}`);
+      console.log("");
+    }
+    return { ok: false, retry };
+  }
+  console.log(`  ${probe.label} available — OpenClaw will use ${probe.api}.`);
+  return { ok: true, api: probe.api };
+}
+
+async function validateAnthropicSelectionWithRetryMessage(
+  label,
+  endpointUrl,
+  model,
+  credentialEnv,
+  retryMessage = "Please choose a provider/model again.",
+  helpUrl = null,
+) {
+  const apiKey = getCredential(credentialEnv);
+  const probe = probeAnthropicEndpoint(endpointUrl, model, apiKey);
+  if (!probe.ok) {
+    console.error(`  ${label} endpoint validation failed.`);
+    console.error(`  ${probe.message}`);
+    if (isNonInteractive()) {
+      process.exit(1);
+    }
+    const retry = await promptValidationRecovery(
+      label,
+      getProbeRecovery(probe),
+      credentialEnv,
+      helpUrl,
+    );
+    if (retry === "selection") {
+      console.log(`  ${retryMessage}`);
+      console.log("");
+    }
+    return { ok: false, retry };
+  }
+  console.log(`  ${probe.label} available — OpenClaw will use ${probe.api}.`);
+  return { ok: true, api: probe.api };
+}
+
+async function validateCustomOpenAiLikeSelection(
+  label,
+  endpointUrl,
+  model,
+  credentialEnv,
+  helpUrl = null,
+) {
+  const apiKey = getCredential(credentialEnv);
+  const probe = probeOpenAiLikeEndpoint(endpointUrl, model, apiKey);
+  if (probe.ok) {
+    console.log(`  ${probe.label} available — OpenClaw will use ${probe.api}.`);
+    return { ok: true, api: probe.api };
+  }
+  console.error(`  ${label} endpoint validation failed.`);
+  console.error(`  ${probe.message}`);
+  if (isNonInteractive()) {
+    process.exit(1);
+  }
+  const retry = await promptValidationRecovery(
+    label,
+    getProbeRecovery(probe, { allowModelRetry: true }),
+    credentialEnv,
+    helpUrl,
+  );
+  if (retry === "selection") {
+    console.log("  Please choose a provider/model again.");
+    console.log("");
+  }
+  return { ok: false, retry };
+}
+
+async function validateCustomAnthropicSelection(
+  label,
+  endpointUrl,
+  model,
+  credentialEnv,
+  helpUrl = null,
+) {
+  const apiKey = getCredential(credentialEnv);
+  const probe = probeAnthropicEndpoint(endpointUrl, model, apiKey);
+  if (probe.ok) {
+    console.log(`  ${probe.label} available — OpenClaw will use ${probe.api}.`);
+    return { ok: true, api: probe.api };
+  }
+  console.error(`  ${label} endpoint validation failed.`);
+  console.error(`  ${probe.message}`);
+  if (isNonInteractive()) {
+    process.exit(1);
+  }
+  const retry = await promptValidationRecovery(
+    label,
+    getProbeRecovery(probe, { allowModelRetry: true }),
+    credentialEnv,
+    helpUrl,
+  );
+  if (retry === "selection") {
+    console.log("  Please choose a provider/model again.");
+    console.log("");
+  }
+  return { ok: false, retry };
+}
+
+function fetchNvidiaEndpointModels(apiKey) {
+  try {
+    const result = runCurlProbe([
+      "-sS",
+      ...getCurlTimingArgs(),
+      "-H",
+      "Content-Type: application/json",
+      "-H",
+      `Authorization: Bearer ${normalizeCredentialValue(apiKey)}`,
+      `${BUILD_ENDPOINT_URL}/models`,
+    ]);
+    if (!result.ok) {
+      return {
+        ok: false,
+        message: result.message,
+        status: result.httpStatus,
+        curlStatus: result.curlStatus,
+      };
+    }
+    const parsed = JSON.parse(result.body);
+    const ids = Array.isArray(parsed?.data)
+      ? parsed.data.map((item) => item && item.id).filter(Boolean)
+      : [];
+    return { ok: true, ids };
+  } catch (error) {
+    return { ok: false, message: error.message || String(error) };
+  }
+}
+
+function validateNvidiaEndpointModel(model, apiKey) {
+  const available = fetchNvidiaEndpointModels(apiKey);
+  if (!available.ok) {
+    return {
+      ok: false,
+      message: `Could not validate model against ${BUILD_ENDPOINT_URL}/models: ${available.message}`,
+    };
+  }
+  if (available.ids.includes(model)) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    message: `Model '${model}' is not available from NVIDIA Endpoints. Checked ${BUILD_ENDPOINT_URL}/models.`,
+  };
+}
+
+function fetchOpenAiLikeModels(endpointUrl, apiKey) {
+  try {
+    const result = runCurlProbe([
+      "-sS",
+      ...getCurlTimingArgs(),
+      ...(apiKey ? ["-H", `Authorization: Bearer ${normalizeCredentialValue(apiKey)}`] : []),
+      `${String(endpointUrl).replace(/\/+$/, "")}/models`,
+    ]);
+    if (!result.ok) {
+      return {
+        ok: false,
+        status: result.httpStatus,
+        curlStatus: result.curlStatus,
+        message: result.message,
+      };
+    }
+    const parsed = JSON.parse(result.body);
+    const ids = Array.isArray(parsed?.data)
+      ? parsed.data.map((item) => item && item.id).filter(Boolean)
+      : [];
+    return { ok: true, ids };
+  } catch (error) {
+    return { ok: false, status: 0, message: error.message || String(error) };
+  }
+}
+
+function fetchAnthropicModels(endpointUrl, apiKey) {
+  try {
+    const result = runCurlProbe([
+      "-sS",
+      ...getCurlTimingArgs(),
+      "-H",
+      `x-api-key: ${normalizeCredentialValue(apiKey)}`,
+      "-H",
+      "anthropic-version: 2023-06-01",
+      `${String(endpointUrl).replace(/\/+$/, "")}/v1/models`,
+    ]);
+    if (!result.ok) {
+      return {
+        ok: false,
+        status: result.httpStatus,
+        curlStatus: result.curlStatus,
+        message: result.message,
+      };
+    }
+    const parsed = JSON.parse(result.body);
+    const ids = Array.isArray(parsed?.data)
+      ? parsed.data.map((item) => item && (item.id || item.name)).filter(Boolean)
+      : [];
+    return { ok: true, ids };
+  } catch (error) {
+    return { ok: false, status: 0, message: error.message || String(error) };
+  }
+}
+
+function validateAnthropicModel(endpointUrl, model, apiKey) {
+  const available = fetchAnthropicModels(endpointUrl, apiKey);
+  if (!available.ok) {
+    if (available.status === 404 || available.status === 405) {
+      return { ok: true, validated: false };
+    }
+    return {
+      ok: false,
+      message: `Could not validate model against ${String(endpointUrl).replace(/\/+$/, "")}/v1/models: ${available.message}`,
+    };
+  }
+  if (available.ids.includes(model)) {
+    return { ok: true, validated: true };
+  }
+  return {
+    ok: false,
+    message: `Model '${model}' is not available from Anthropic. Checked ${String(endpointUrl).replace(/\/+$/, "")}/v1/models.`,
+  };
+}
+
+function validateOpenAiLikeModel(label, endpointUrl, model, apiKey) {
+  const available = fetchOpenAiLikeModels(endpointUrl, apiKey);
+  if (!available.ok) {
+    if (available.status === 404 || available.status === 405) {
+      return { ok: true, validated: false };
+    }
+    return {
+      ok: false,
+      message: `Could not validate model against ${String(endpointUrl).replace(/\/+$/, "")}/models: ${available.message}`,
+    };
+  }
+  if (available.ids.includes(model)) {
+    return { ok: true, validated: true };
+  }
+  return {
+    ok: false,
+    message: `Model '${model}' is not available from ${label}. Checked ${String(endpointUrl).replace(/\/+$/, "")}/models.`,
+  };
+}
+
+async function promptManualModelId(promptLabel, errorLabel, validator = null) {
+  while (true) {
+    const manual = await prompt(promptLabel);
+    const trimmed = manual.trim();
+    const navigation = getNavigationChoice(trimmed);
+    if (navigation === "back") {
+      return BACK_TO_SELECTION;
+    }
+    if (navigation === "exit") {
+      exitOnboardFromPrompt();
+    }
+    if (!trimmed || !isSafeModelId(trimmed)) {
+      console.error(`  Invalid ${errorLabel} model id.`);
+      continue;
+    }
+    if (validator) {
+      const validation = validator(trimmed);
+      if (!validation.ok) {
+        console.error(`  ${validation.message}`);
+        continue;
+      }
+    }
+    return trimmed;
+  }
+}
+// Build context helpers — delegated to src/lib/build-context.ts
+const { shouldIncludeBuildContextPath, copyBuildContextDir, printSandboxCreateRecoveryHints } =
+  buildContext;
+// classifySandboxCreateFailure — see validation import above
+
+async function promptCloudModel() {
+  console.log("");
+  console.log("  Cloud models:");
+  CLOUD_MODEL_OPTIONS.forEach((option, index) => {
+    console.log(`    ${index + 1}) ${option.label} (${option.id})`);
+  });
+  console.log(`    ${CLOUD_MODEL_OPTIONS.length + 1}) Other...`);
+  console.log("");
+
+  const choice = await prompt("  Choose model [1]: ");
+  const navigation = getNavigationChoice(choice);
+  if (navigation === "back") {
+    return BACK_TO_SELECTION;
+  }
+  if (navigation === "exit") {
+    exitOnboardFromPrompt();
+  }
+  const index = parseInt(choice || "1", 10) - 1;
+  if (index >= 0 && index < CLOUD_MODEL_OPTIONS.length) {
+    return CLOUD_MODEL_OPTIONS[index].id;
+  }
+
+  return promptManualModelId("  NVIDIA Endpoints model id: ", "NVIDIA Endpoints", (model) =>
+    validateNvidiaEndpointModel(model, getCredential("NVIDIA_API_KEY")),
+  );
+}
+
+async function promptRemoteModel(label, providerKey, defaultModel, validator = null) {
+  const options = REMOTE_MODEL_OPTIONS[providerKey] || [];
+  const defaultIndex = Math.max(0, options.indexOf(defaultModel));
+
+  console.log("");
+  console.log(`  ${label} models:`);
+  options.forEach((option, index) => {
+    console.log(`    ${index + 1}) ${option}`);
+  });
+  console.log(`    ${options.length + 1}) Other...`);
+  console.log("");
+
+  const choice = await prompt(`  Choose model [${defaultIndex + 1}]: `);
+  const navigation = getNavigationChoice(choice);
+  if (navigation === "back") {
+    return BACK_TO_SELECTION;
+  }
+  if (navigation === "exit") {
+    exitOnboardFromPrompt();
+  }
+  const index = parseInt(choice || String(defaultIndex + 1), 10) - 1;
+  if (index >= 0 && index < options.length) {
+    return options[index];
+  }
+
+  return promptManualModelId(`  ${label} model id: `, label, validator);
+}
+
+async function promptInputModel(label, defaultModel, validator = null) {
+  while (true) {
+    const value = await prompt(`  ${label} model [${defaultModel}]: `);
+    const navigation = getNavigationChoice(value);
+    if (navigation === "back") {
+      return BACK_TO_SELECTION;
+    }
+    if (navigation === "exit") {
+      exitOnboardFromPrompt();
+    }
+    const trimmed = (value || defaultModel).trim();
+    if (!trimmed || !isSafeModelId(trimmed)) {
+      console.error(`  Invalid ${label} model id.`);
+      continue;
+    }
+    if (validator) {
+      const validation = validator(trimmed);
+      if (!validation.ok) {
+        console.error(`  ${validation.message}`);
+        continue;
+      }
+    }
+    return trimmed;
+  }
+}
+
+async function promptOllamaModel(gpu = null) {
+  const installed = getInstalledOllamaModels(runCapture);
+  const options = installed.length > 0 ? installed : getBootstrapOllamaModelOptions(gpu);
+  const defaultModel = installed.length > 0 ? getDefaultOllamaModel(runCapture, gpu) : options[0];
+  const defaultIndex = Math.max(0, options.indexOf(defaultModel));
+
+  console.log("");
+  console.log(installed.length > 0 ? "  Ollama models:" : "  Ollama starter models:");
+  options.forEach((option, index) => {
+    console.log(`    ${index + 1}) ${option}`);
+  });
+  console.log(`    ${options.length + 1}) Other...`);
+  if (installed.length === 0) {
+    console.log("");
+    console.log("  No local Ollama models are installed yet. Choose one to pull and load now.");
+  }
+  console.log("");
+
+  const choice = await prompt(`  Choose model [${defaultIndex + 1}]: `);
+  const index = parseInt(choice || String(defaultIndex + 1), 10) - 1;
+  if (index >= 0 && index < options.length) {
+    return options[index];
+  }
+  return promptManualModelId("  Ollama model id: ", "Ollama");
+}
+
+function pullOllamaModel(model) {
+  const result = spawnSync("bash", ["-c", `ollama pull ${shellQuote(model)}`], {
+    cwd: ROOT,
+    encoding: "utf8",
+    stdio: "inherit",
+    timeout: 600_000,
+    env: { ...process.env },
+  });
+  if (result.signal === "SIGTERM") {
+    console.error(
+      `  Model pull timed out after 10 minutes. Try a smaller model or check your network connection.`,
+    );
     return false;
   }
+  return result.status === 0;
+}
+
+function prepareOllamaModel(model, installedModels = []) {
+  const alreadyInstalled = installedModels.includes(model);
+  if (!alreadyInstalled) {
+    console.log(`  Pulling Ollama model: ${model}`);
+    if (!pullOllamaModel(model)) {
+      return {
+        ok: false,
+        message:
+          `Failed to pull Ollama model '${model}'. ` +
+          "Check the model name and that Ollama can access the registry, then try another model.",
+      };
+    }
+  }
+
+  console.log(`  Loading Ollama model: ${model}`);
+  run(getOllamaWarmupCommand(model), { ignoreError: true });
+  return validateOllamaModel(model, runCapture);
+}
+
+function getRequestedSandboxNameHint() {
+  const raw = process.env.NEMOCLAW_SANDBOX_NAME;
+  if (typeof raw !== "string") return null;
+  const normalized = raw.trim().toLowerCase();
+  return normalized || null;
+}
+
+function getResumeSandboxConflict(session) {
+  const requestedSandboxName = getRequestedSandboxNameHint();
+  if (!requestedSandboxName || !session?.sandboxName) {
+    return null;
+  }
+  return requestedSandboxName !== session.sandboxName
+    ? { requestedSandboxName, recordedSandboxName: session.sandboxName }
+    : null;
+}
+
+function getRequestedProviderHint(nonInteractive = isNonInteractive()) {
+  return nonInteractive ? getNonInteractiveProvider() : null;
+}
+
+function getRequestedModelHint(nonInteractive = isNonInteractive()) {
+  if (!nonInteractive) return null;
+  const providerKey = getRequestedProviderHint(nonInteractive) || "cloud";
+  return getNonInteractiveModel(providerKey);
+}
+
+function getEffectiveProviderName(providerKey) {
+  if (!providerKey) return null;
+  if (REMOTE_PROVIDER_CONFIG[providerKey]) {
+    return REMOTE_PROVIDER_CONFIG[providerKey].providerName;
+  }
+
+  switch (providerKey) {
+    case "nim-local":
+      return "nvidia-nim";
+    case "ollama":
+      return "ollama-local";
+    case "vllm":
+      return "vllm-local";
+    default:
+      return providerKey;
+  }
+}
+
+function getResumeConfigConflicts(session, opts = {}) {
+  const conflicts = [];
+  const nonInteractive = opts.nonInteractive ?? isNonInteractive();
+
+  const sandboxConflict = getResumeSandboxConflict(session);
+  if (sandboxConflict) {
+    conflicts.push({
+      field: "sandbox",
+      requested: sandboxConflict.requestedSandboxName,
+      recorded: sandboxConflict.recordedSandboxName,
+    });
+  }
+
+  const requestedProvider = getRequestedProviderHint(nonInteractive);
+  const effectiveRequestedProvider = getEffectiveProviderName(requestedProvider);
+  if (
+    effectiveRequestedProvider &&
+    session?.provider &&
+    effectiveRequestedProvider !== session.provider
+  ) {
+    conflicts.push({
+      field: "provider",
+      requested: effectiveRequestedProvider,
+      recorded: session.provider,
+    });
+  }
+
+  const requestedModel = getRequestedModelHint(nonInteractive);
+  if (requestedModel && session?.model && requestedModel !== session.model) {
+    conflicts.push({
+      field: "model",
+      requested: requestedModel,
+      recorded: session.model,
+    });
+  }
+
+  return conflicts;
 }
 
 function getContainerRuntime() {
   const info = runCapture("docker info 2>/dev/null", { ignoreError: true });
   return inferContainerRuntime(info);
+}
+
+function printRemediationActions(actions) {
+  if (!Array.isArray(actions) || actions.length === 0) {
+    return;
+  }
+
+  console.error("");
+  console.error("  Suggested fix:");
+  console.error("");
+  for (const action of actions) {
+    console.error(`  - ${action.title}: ${action.reason}`);
+    for (const command of action.commands || []) {
+      console.error(`    ${command}`);
+    }
+  }
 }
 
 function isOpenshellInstalled() {
@@ -819,12 +1948,28 @@ function getFutureShellPathHint(binDir, pathValue = process.env.PATH || "") {
   return `export PATH="${binDir}:$PATH"`;
 }
 
+function getPortConflictServiceHints(platform = process.platform) {
+  if (platform === "darwin") {
+    return [
+      "       # or, if it's a launchctl service (macOS):",
+      "       launchctl list | grep -i claw   # columns: PID | ExitStatus | Label",
+      `       launchctl unload ${OPENCLAW_LAUNCH_AGENT_PLIST}`,
+      "       # or: launchctl bootout gui/$(id -u)/ai.openclaw.gateway",
+    ];
+  }
+  return [
+    "       # or, if it's a systemd service:",
+    "       systemctl --user stop openclaw-gateway.service",
+  ];
+}
+
 function installOpenshell() {
   const result = spawnSync("bash", [path.join(SCRIPTS, "install-openshell.sh")], {
     cwd: ROOT,
     env: process.env,
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf-8",
+    timeout: 300_000,
   });
   if (result.status !== 0) {
     const output = `${result.stdout || ""}${result.stderr || ""}`.trim();
@@ -854,44 +1999,47 @@ function sleep(seconds) {
 }
 
 function destroyGateway() {
-  runOpenshell(["gateway", "destroy", "-g", GATEWAY_NAME], { ignoreError: true });
+  const destroyResult = runOpenshell(["gateway", "destroy", "-g", GATEWAY_NAME], {
+    ignoreError: true,
+  });
+  // Clear the local registry so `nemoclaw list` stays consistent with OpenShell state. (#532)
+  if (destroyResult.status === 0) {
+    registry.clearAll();
+  }
   // openshell gateway destroy doesn't remove Docker volumes, which leaves
   // corrupted cluster state that breaks the next gateway start. Clean them up.
-  run(`docker volume ls -q --filter "name=openshell-cluster-${GATEWAY_NAME}" | grep . && docker volume ls -q --filter "name=openshell-cluster-${GATEWAY_NAME}" | xargs docker volume rm || true`, { ignoreError: true });
+  run(
+    `docker volume ls -q --filter "name=openshell-cluster-${GATEWAY_NAME}" | grep . && docker volume ls -q --filter "name=openshell-cluster-${GATEWAY_NAME}" | xargs docker volume rm || true`,
+    { ignoreError: true },
+  );
 }
 
-async function _ensureNamedCredential(envName, label, helpUrl = null) {
+async function ensureNamedCredential(envName, label, helpUrl = null) {
   let key = getCredential(envName);
   if (key) {
     process.env[envName] = key;
     return key;
   }
-
-  if (helpUrl) {
-    console.log("");
-    console.log(`  Get your ${label} from: ${helpUrl}`);
-    console.log("");
-  }
-
-  key = await prompt(`  ${label}: `, { secret: true });
-  if (!key) {
-    console.error(`  ${label} is required.`);
-    process.exit(1);
-  }
-
-  saveCredential(envName, key);
-  process.env[envName] = key;
-  console.log("");
-  console.log(`  Key saved to ~/.nemoclaw/credentials.json (mode 600)`);
-  console.log("");
-  return key;
+  return replaceNamedCredential(envName, label, helpUrl);
 }
 
 function waitForSandboxReady(sandboxName, attempts = 10, delaySeconds = 2) {
   for (let i = 0; i < attempts; i += 1) {
     const podPhase = runCaptureOpenshell(
-      ["doctor", "exec", "--", "kubectl", "-n", "openshell", "get", "pod", sandboxName, "-o", "jsonpath={.status.phase}"],
-      { ignoreError: true }
+      [
+        "doctor",
+        "exec",
+        "--",
+        "kubectl",
+        "-n",
+        "openshell",
+        "get",
+        "pod",
+        sandboxName,
+        "-o",
+        "jsonpath={.status.phase}",
+      ],
+      { ignoreError: true },
     );
     if (podPhase === "Running") return true;
     sleep(delaySeconds);
@@ -899,57 +2047,35 @@ function waitForSandboxReady(sandboxName, attempts = 10, delaySeconds = 2) {
   return false;
 }
 
-function getSandboxState(sandboxName) {
-  const registryEntry = registry.getSandbox(sandboxName);
-  const output = runCapture(`openshell sandbox get "${sandboxName}"`, {
-    ignoreError: true,
-  });
-  const liveSandboxExists = !!output;
-
-  return {
-    registryEntry,
-    liveSandboxExists,
-    hasStaleRegistryEntry: !!registryEntry && !liveSandboxExists,
-    shouldHydrateRegistry: liveSandboxExists && !registryEntry,
-  };
-}
-
-function parsePolicyPresetEnv(value) {
-  return (value || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-function isSafeModelId(value) {
-  return /^[A-Za-z0-9._:/-]+$/.test(value);
-}
+// parsePolicyPresetEnv — see urlUtils import above
+// isSafeModelId — see validation import above
 
 function getNonInteractiveProvider() {
   const providerKey = (process.env.NEMOCLAW_PROVIDER || "").trim().toLowerCase();
   if (!providerKey) return null;
-
   const aliases = {
-    cloud: "nvidia-prod",
-    ollama: "ollama-local",
-    vllm: "vllm-local",
-    nim: "nvidia-nim",
+    cloud: "build",
+    nim: "nim-local",
+    vllm: "vllm",
+    anthropiccompatible: "anthropicCompatible",
   };
   const normalized = aliases[providerKey] || providerKey;
   const validProviders = new Set([
-    "nvidia-prod",
-    "nvidia-nim",
-    "openai-api",
-    "anthropic-prod",
-    "gemini-api",
-    "compatible-endpoint",
-    "compatible-anthropic-endpoint",
-    "ollama-local",
-    "vllm-local",
+    "build",
+    "openai",
+    "anthropic",
+    "anthropicCompatible",
+    "gemini",
+    "ollama",
+    "custom",
+    "nim-local",
+    "vllm",
   ]);
   if (!validProviders.has(normalized)) {
     console.error(`  Unsupported NEMOCLAW_PROVIDER: ${providerKey}`);
-    console.error("  Valid values: nvidia-prod, openai-api, anthropic-prod, gemini-api, compatible-endpoint, compatible-anthropic-endpoint, ollama-local, vllm-local");
+    console.error(
+      "  Valid values: build, openai, anthropic, anthropicCompatible, gemini, ollama, custom, nim-local, vllm",
+    );
     process.exit(1);
   }
 
@@ -967,115 +2093,33 @@ function getNonInteractiveModel(providerKey) {
   return model;
 }
 
-function getCurlTimingArgs() {
-  return ["--connect-timeout 5", "--max-time 20"];
-}
-
-function normalizeBaseUrl(url) {
-  return String(url || "").trim().replace(/\/+$/, "");
-}
-
-function runCurlJson(url, opts = {}) {
-  const bodyPath = path.join(os.tmpdir(), `nemoclaw-curl-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
-  const timingArgs = getCurlTimingArgs().flatMap((entry) => entry.split(" "));
-  const args = ["-sS", "-o", bodyPath, ...timingArgs, "-w", "%{http_code}"];
-  if (opts.method) args.push("-X", opts.method);
-  if (opts.headers) {
-    for (const header of opts.headers) {
-      args.push("-H", header);
-    }
-  }
-  if (opts.body !== undefined) {
-    args.push("-d", typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body));
-  }
-  args.push(url);
-
-  const result = spawnSync("curl", args, {
-    cwd: ROOT,
-    encoding: "utf-8",
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  let responseBody;
-  try {
-    responseBody = fs.readFileSync(bodyPath, "utf-8");
-  } catch {
-    responseBody = "";
-  }
-  fs.rmSync(bodyPath, { force: true });
-
-  const statusCode = parseInt(String(result.stdout || "").trim() || "0", 10);
-  let parsed;
-  try {
-    parsed = responseBody ? JSON.parse(responseBody) : null;
-  } catch {
-    parsed = null;
-  }
-
-  return {
-    ok: result.status === 0 && statusCode >= 200 && statusCode < 300,
-    statusCode,
-    body: responseBody,
-    json: parsed,
-  };
-}
-
-let OPENSHELL_BIN = null;
-
-function getOpenshellBinary() {
-  if (OPENSHELL_BIN) return OPENSHELL_BIN;
-  const resolved = resolveOpenshell();
-  if (!resolved) {
-    console.error("  openshell CLI not found.");
-    console.error("  Install manually: https://github.com/NVIDIA/OpenShell/releases");
-    process.exit(1);
-  }
-  OPENSHELL_BIN = resolved;
-  return OPENSHELL_BIN;
-}
-
-function openshellShellCommand(args) {
-  return [shellQuote(getOpenshellBinary()), ...args.map((arg) => shellQuote(arg))].join(" ");
-}
-
-function runOpenshell(args, opts = {}) {
-  return run(openshellShellCommand(args), opts);
-}
-
-function runCaptureOpenshell(args, opts = {}) {
-  return runCapture(openshellShellCommand(args), opts);
-}
-
-function getInstalledOpenshellVersion() {
-  const output = runCaptureOpenshell(["--version"], { ignoreError: true });
-  if (!output) return null;
-  const match = output.trim().match(/(\d+\.\d+\.\d+\S*)/);
-  return match ? match[1] : null;
-}
-
 // ── Step 1: Preflight ────────────────────────────────────────────
 
 // eslint-disable-next-line complexity
 async function preflight() {
   step(1, 7, "Preflight checks");
 
-  // Docker
-  if (!isDockerRunning()) {
-    console.error("  Docker is not running. Please start Docker and try again.");
+  const host = assessHost();
+
+  // Docker / runtime
+  if (!host.dockerReachable) {
+    console.error("  Docker is not reachable. Please fix Docker and try again.");
+    printRemediationActions(planHostRemediation(host));
     process.exit(1);
   }
   console.log("  ✓ Docker is running");
 
-  const runtime = getContainerRuntime();
-  if (isUnsupportedMacosRuntime(runtime)) {
-    console.error("  Podman on macOS is not supported by NemoClaw at this time.");
-    console.error("  OpenShell currently depends on Docker host-gateway behavior that Podman on macOS does not provide.");
-    console.error("  Use Colima or Docker Desktop on macOS instead.");
-    process.exit(1);
+  if (host.runtime !== "unknown") {
+    console.log(`  ✓ Container runtime: ${host.runtime}`);
   }
-  if (runtime !== "unknown") {
-    console.log(`  ✓ Container runtime: ${runtime}`);
+  if (host.isUnsupportedRuntime) {
+    console.warn(
+      "  ! Podman is not a supported OpenShell runtime. NemoClaw will continue, but your experience may vary.",
+    );
+    printRemediationActions(planHostRemediation(host));
+  }
+  if (host.notes.includes("Running under WSL")) {
+    console.log("  ⓘ Running under WSL");
   }
 
   // OpenShell CLI
@@ -1089,73 +2133,41 @@ async function preflight() {
       process.exit(1);
     }
   }
-  console.log(`  ✓ openshell CLI: ${runCaptureOpenshell(["--version"], { ignoreError: true }) || "unknown"}`);
+  console.log(
+    `  ✓ openshell CLI: ${runCaptureOpenshell(["--version"], { ignoreError: true }) || "unknown"}`,
+  );
   if (openshellInstall.futureShellPathHint) {
-    console.log(`  Note: openshell was installed to ${openshellInstall.localBin} for this onboarding run.`);
+    console.log(
+      `  Note: openshell was installed to ${openshellInstall.localBin} for this onboarding run.`,
+    );
     console.log(`  Future shells may still need: ${openshellInstall.futureShellPathHint}`);
-    console.log("  Add that export to your shell profile, or open a new terminal before running openshell directly.");
+    console.log(
+      "  Add that export to your shell profile, or open a new terminal before running openshell directly.",
+    );
   }
 
-  // Gateway cleanup/reuse logic
-  const gwInfo = runCapture("openshell gateway info -g nemoclaw 2>/dev/null", { ignoreError: true });
+  // Clean up stale or unnamed NemoClaw gateway state before checking ports.
+  // A healthy named gateway can be reused later in onboarding, so avoid
+  // tearing it down here. If some other gateway is active, do not treat it
+  // as NemoClaw state; let the port checks surface the conflict instead.
   const gatewayStatus = runCaptureOpenshell(["status"], { ignoreError: true });
-  const dockerGatewayContainers = runCapture("docker ps -a --format '{{.Names}}' 2>/dev/null", { ignoreError: true });
-  let reusingGateway = false;
-
-  if (hasStaleGateway(gwInfo)) {
-    // Check if the existing gateway is actually running (owning port 8080)
-    // If it is, we prefer to reuse it to preserve sandboxes.
-    const port8080 = await checkPortAvailable(8080);
-    if (!port8080.ok && hasLocalGatewayContainer(GATEWAY_NAME, dockerGatewayContainers)) {
-      // Port 8080 is in use by the expected local NemoClaw gateway container.
-      console.log("  Found active NemoClaw gateway. Reusing existing session to preserve sandboxes.");
-      reusingGateway = true;
-    } else if (!port8080.ok) {
-      // Metadata exists but the expected local container does not. This usually
-      // means a foreign local gateway was aliased as 'nemoclaw', which cannot
-      // be reused for image upload because OpenShell still expects the local
-      // Docker container name to match the gateway name.
-      const sandboxList = runCaptureOpenshell(["sandbox", "list"], { ignoreError: true });
-      const localGatewayNames = listLocalGatewayNames(dockerGatewayContainers);
-      const foreignGatewayName = localGatewayNames.find((name) => name !== GATEWAY_NAME) || getReportedGatewayName(gatewayStatus) || "existing";
-      console.log(`  Found NemoClaw gateway metadata, but local container '${getGatewayClusterContainerName(GATEWAY_NAME)}' does not exist.`);
-      const action = await promptForExistingGatewayAction(foreignGatewayName, countListedSandboxes(sandboxList));
-      if (action === "abort") {
-        console.log("  Cancelled.");
-        process.exit(1);
-      }
-      console.log(`  Recreating existing gateway '${foreignGatewayName}' for NemoClaw...`);
-      run("openshell forward stop 18789 2>/dev/null || true", { ignoreError: true });
-      if (foreignGatewayName && foreignGatewayName !== GATEWAY_NAME) {
-        runOpenshell(["gateway", "destroy", "-g", foreignGatewayName], { ignoreError: true });
-      }
-      runOpenshell(["gateway", "destroy", "-g", GATEWAY_NAME], { ignoreError: true });
-      console.log(`  ✓ Removed stale gateway metadata and existing gateway '${foreignGatewayName}'`);
-    } else {
-      // Gateway exists in config but port 8080 is free, so it's stopped or broken.
-      console.log("  Cleaning up stopped/stale NemoClaw session...");
-      run("openshell forward stop 18789 2>/dev/null || true", { ignoreError: true });
-      run("openshell gateway destroy -g nemoclaw 2>/dev/null || true", { ignoreError: true });
-      console.log("  ✓ Previous session cleaned up");
+  const gwInfo = runCaptureOpenshell(["gateway", "info", "-g", GATEWAY_NAME], {
+    ignoreError: true,
+  });
+  const activeGatewayInfo = runCaptureOpenshell(["gateway", "info"], { ignoreError: true });
+  const gatewayReuseState = getGatewayReuseState(gatewayStatus, gwInfo, activeGatewayInfo);
+  if (gatewayReuseState === "stale" || gatewayReuseState === "active-unnamed") {
+    console.log("  Cleaning up previous NemoClaw session...");
+    runOpenshell(["forward", "stop", "18789"], { ignoreError: true });
+    const destroyResult = runOpenshell(["gateway", "destroy", "-g", GATEWAY_NAME], {
+      ignoreError: true,
+    });
+    // Sandboxes under the destroyed gateway no longer exist in OpenShell —
+    // clear the local registry so `nemoclaw list` stays consistent. (#532)
+    if (destroyResult.status === 0) {
+      registry.clearAll();
     }
-  }
-
-  const activeGatewayName = getReportedGatewayName(gatewayStatus);
-  if (!reusingGateway && activeGatewayName && activeGatewayName !== GATEWAY_NAME) {
-    const activeGatewayInfo = runCaptureOpenshell(["gateway", "info", "-g", activeGatewayName], { ignoreError: true });
-    const port8080 = await checkPortAvailable(8080);
-    if (!port8080.ok && hasActiveGatewayInfo(activeGatewayInfo)) {
-      const sandboxList = runCaptureOpenshell(["sandbox", "list"], { ignoreError: true });
-      const action = await promptForExistingGatewayAction(activeGatewayName, countListedSandboxes(sandboxList));
-      if (action === "abort") {
-        console.log("  Cancelled.");
-        process.exit(1);
-      }
-      console.log(`  Recreating existing gateway '${activeGatewayName}' for NemoClaw...`);
-      run("openshell forward stop 18789 2>/dev/null || true", { ignoreError: true });
-      runOpenshell(["gateway", "destroy", "-g", activeGatewayName], { ignoreError: true });
-      console.log(`  ✓ Removed existing gateway '${activeGatewayName}'`);
-    }
+    console.log("  ✓ Previous session cleaned up");
   }
 
   // Required ports — gateway (8080) and dashboard (18789)
@@ -1164,15 +2176,9 @@ async function preflight() {
     { port: 18789, label: "NemoClaw dashboard" },
   ];
   for (const { port, label } of requiredPorts) {
-    // If reusing gateway, we expect port 8080 to be taken by us.
-    if (reusingGateway && port === 8080) {
-      console.log(`  ✓ Port ${port} is active (reusing gateway)`);
-      continue;
-    }
-
     const portCheck = await checkPortAvailable(port);
     if (!portCheck.ok) {
-      if ((port === 8080 || port === 18789) && reusingGateway) {
+      if ((port === 8080 || port === 18789) && gatewayReuseState === "healthy") {
         console.log(`  ✓ Port ${port} already owned by healthy NemoClaw runtime (${label})`);
         continue;
       }
@@ -1181,20 +2187,23 @@ async function preflight() {
       console.error(`     ${label} needs this port.`);
       console.error("");
       if (portCheck.process && portCheck.process !== "unknown") {
-        console.error(`     Blocked by: ${portCheck.process}${portCheck.pid ? ` (PID ${portCheck.pid})` : ""}`);
+        console.error(
+          `     Blocked by: ${portCheck.process}${portCheck.pid ? ` (PID ${portCheck.pid})` : ""}`,
+        );
         console.error("");
         console.error("     To fix, stop the conflicting process:");
         console.error("");
         if (portCheck.pid) {
           console.error(`       sudo kill ${portCheck.pid}`);
         } else {
-          console.error(`       lsof -i :${port} -sTCP:LISTEN -P -n`);
+          console.error(`       sudo lsof -i :${port} -sTCP:LISTEN -P -n`);
         }
-        console.error("       # or, if it's a systemd service:");
-        console.error("       systemctl --user stop openclaw-gateway.service");
+        for (const hint of getPortConflictServiceHints()) {
+          console.error(hint);
+        }
       } else {
         console.error(`     Could not identify the process using port ${port}.`);
-        console.error(`     Run: lsof -i :${port} -sTCP:LISTEN`);
+        console.error(`     Run: sudo lsof -i :${port} -sTCP:LISTEN`);
       }
       console.error("");
       console.error(`     Detail: ${portCheck.reason}`);
@@ -1207,92 +2216,187 @@ async function preflight() {
   const gpu = nim.detectGpu();
   if (gpu && gpu.type === "nvidia") {
     console.log(`  ✓ NVIDIA GPU detected: ${gpu.count} GPU(s), ${gpu.totalMemoryMB} MB VRAM`);
+    if (!gpu.nimCapable) {
+      console.log("  ⓘ GPU VRAM too small for local NIM — will use cloud inference");
+    }
   } else if (gpu && gpu.type === "apple") {
-    console.log(`  ✓ Apple GPU detected: ${gpu.name}${gpu.cores ? ` (${gpu.cores} cores)` : ""}, ${gpu.totalMemoryMB} MB unified memory`);
+    console.log(
+      `  ✓ Apple GPU detected: ${gpu.name}${gpu.cores ? ` (${gpu.cores} cores)` : ""}, ${gpu.totalMemoryMB} MB unified memory`,
+    );
     console.log("  ⓘ NIM requires NVIDIA GPU — will use cloud inference");
   } else {
     console.log("  ⓘ No GPU detected — will use cloud inference");
   }
 
-  return { gpu, reusingGateway };
+  // Memory / swap check (Linux only)
+  if (process.platform === "linux") {
+    const mem = getMemoryInfo();
+    if (mem) {
+      if (mem.totalMB < 12000) {
+        console.log(
+          `  ⚠ Low memory detected (${mem.totalRamMB} MB RAM + ${mem.totalSwapMB} MB swap = ${mem.totalMB} MB total)`,
+        );
+
+        let proceedWithSwap = false;
+        if (!isNonInteractive()) {
+          const answer = await prompt(
+            "  Create a 4 GB swap file to prevent OOM during sandbox build? (requires sudo) [y/N]: ",
+          );
+          proceedWithSwap = answer && answer.toLowerCase().startsWith("y");
+        }
+
+        if (!proceedWithSwap) {
+          console.log(
+            "  ⓘ Skipping swap creation. Sandbox build may fail with OOM on this system.",
+          );
+        } else {
+          console.log("  Creating 4 GB swap file to prevent OOM during sandbox build...");
+          const swapResult = ensureSwap(12000);
+          if (swapResult.ok && swapResult.swapCreated) {
+            console.log("  ✓ Swap file created and activated");
+          } else if (swapResult.ok) {
+            if (swapResult.reason) {
+              console.log(`  ⓘ ${swapResult.reason} — existing swap should help prevent OOM`);
+            } else {
+              console.log(`  ✓ Memory OK: ${mem.totalRamMB} MB RAM + ${mem.totalSwapMB} MB swap`);
+            }
+          } else {
+            console.log(`  ⚠ Could not create swap: ${swapResult.reason}`);
+            console.log("  Sandbox creation may fail with OOM on low-memory systems.");
+          }
+        }
+      } else {
+        console.log(`  ✓ Memory OK: ${mem.totalRamMB} MB RAM + ${mem.totalSwapMB} MB swap`);
+      }
+    }
+  }
+
+  return gpu;
 }
 
 // ── Step 2: Gateway ──────────────────────────────────────────────
 
 async function startGatewayWithOptions(_gpu, { exitOnFailure = true } = {}) {
-  step(3, 7, "Starting OpenShell gateway");
+  step(2, 7, "Starting OpenShell gateway");
 
   const gatewayStatus = runCaptureOpenshell(["status"], { ignoreError: true });
-  const gwInfo = runCaptureOpenshell(["gateway", "info", "-g", GATEWAY_NAME], { ignoreError: true });
-  if (isGatewayHealthy(gatewayStatus, gwInfo)) {
+  const gwInfo = runCaptureOpenshell(["gateway", "info", "-g", GATEWAY_NAME], {
+    ignoreError: true,
+  });
+  const activeGatewayInfo = runCaptureOpenshell(["gateway", "info"], { ignoreError: true });
+  if (isGatewayHealthy(gatewayStatus, gwInfo, activeGatewayInfo)) {
     console.log("  ✓ Reusing existing gateway");
     runOpenshell(["gateway", "select", GATEWAY_NAME], { ignoreError: true });
     process.env.OPENSHELL_GATEWAY = GATEWAY_NAME;
     return;
   }
 
+  // When a stale gateway is detected (metadata exists but container is gone,
+  // e.g. after a Docker/Colima restart), skip the destroy — `gateway start`
+  // can recover the container without wiping metadata and mTLS certs.
+  // The retry loop below will destroy only if start genuinely fails.
   if (hasStaleGateway(gwInfo)) {
-    runOpenshell(["gateway", "destroy", "-g", GATEWAY_NAME], { ignoreError: true });
+    console.log("  Stale gateway detected — attempting restart without destroy...");
   }
 
   const gwArgs = ["--name", GATEWAY_NAME];
-  const gatewayEnv = {};
-  const openshellVersion = getInstalledOpenshellVersion();
-  const stableGatewayImage = openshellVersion
-    ? `ghcr.io/nvidia/openshell/cluster:${openshellVersion}`
-    : null;
-  if (stableGatewayImage && openshellVersion) {
-    gatewayEnv.OPENSHELL_CLUSTER_IMAGE = stableGatewayImage;
-    gatewayEnv.IMAGE_TAG = openshellVersion;
-    console.log(`  Using pinned OpenShell gateway image: ${stableGatewayImage}`);
+  // Do NOT pass --gpu here. On DGX Spark (and most GPU hosts), inference is
+  // routed through a host-side provider (Ollama, vLLM, or cloud API) — the
+  // sandbox itself does not need direct GPU access. Passing --gpu causes
+  // FailedPrecondition errors when the gateway's k3s device plugin cannot
+  // allocate GPUs. See: https://build.nvidia.com/spark/nemoclaw/instructions
+  const gatewayEnv = getGatewayStartEnv();
+  if (gatewayEnv.OPENSHELL_CLUSTER_IMAGE) {
+    console.log(`  Using pinned OpenShell gateway image: ${gatewayEnv.OPENSHELL_CLUSTER_IMAGE}`);
   }
 
-  const startResult = runOpenshell(["gateway", "start", ...gwArgs], { ignoreError: true, env: gatewayEnv });
-  if (startResult.status !== 0) {
-    console.error("  Gateway failed to start. Cleaning up stale state...");
-    destroyGateway();
+  // Retry gateway start with exponential backoff. On some hosts (Horde VMs,
+  // first-run environments) the embedded k3s needs more time than OpenShell's
+  // internal health-check window allows. Retrying after a clean destroy lets
+  // the second attempt benefit from cached images and cleaner cgroup state.
+  // See: https://github.com/NVIDIA/OpenShell/issues/433
+  const retries = exitOnFailure ? 2 : 0;
+  try {
+    await pRetry(
+      async () => {
+        const startResult = await streamGatewayStart(
+          openshellShellCommand(["gateway", "start", ...gwArgs]),
+          {
+            ...process.env,
+            ...gatewayEnv,
+          },
+        );
+        if (startResult.status !== 0) {
+          const output = compactText(String(startResult.output || ""));
+          if (output) {
+            console.log(`  Gateway start returned before healthy: ${output.slice(0, 240)}`);
+          }
+        }
+        console.log("  Waiting for gateway health...");
+
+        const healthPollCount = envInt("NEMOCLAW_HEALTH_POLL_COUNT", 5);
+        const healthPollInterval = envInt("NEMOCLAW_HEALTH_POLL_INTERVAL", 2);
+        for (let i = 0; i < healthPollCount; i++) {
+          const status = runCaptureOpenshell(["status"], { ignoreError: true });
+          const namedInfo = runCaptureOpenshell(["gateway", "info", "-g", GATEWAY_NAME], {
+            ignoreError: true,
+          });
+          const currentInfo = runCaptureOpenshell(["gateway", "info"], { ignoreError: true });
+          if (isGatewayHealthy(status, namedInfo, currentInfo)) {
+            return; // success
+          }
+          if (i < healthPollCount - 1) sleep(healthPollInterval);
+        }
+
+        throw new Error("Gateway failed to start");
+      },
+      {
+        retries,
+        minTimeout: 10_000,
+        factor: 3,
+        onFailedAttempt: (err) => {
+          console.log(
+            `  Gateway start attempt ${err.attemptNumber} failed. ${err.retriesLeft} retries left...`,
+          );
+          if (err.retriesLeft > 0 && exitOnFailure) {
+            destroyGateway();
+          }
+        },
+      },
+    );
+  } catch {
     if (exitOnFailure) {
-      console.error("  Stale state removed. Please rerun: nemoclaw onboard");
+      console.error(`  Gateway failed to start after ${retries + 1} attempts.`);
+      console.error("  Gateway state preserved for diagnostics.");
+      console.error("");
+      console.error("  Troubleshooting:");
+      console.error("    openshell doctor logs --name nemoclaw");
+      console.error("    openshell doctor check");
       process.exit(1);
     }
     throw new Error("Gateway failed to start");
   }
 
-  // Verify health
-  for (let i = 0; i < 5; i++) {
-    const status = runCaptureOpenshell(["status"], { ignoreError: true });
-    const gwInfo = runCaptureOpenshell(["gateway", "info", "-g", GATEWAY_NAME], { ignoreError: true });
-    if (isGatewayHealthy(status, gwInfo)) {
-      console.log("  ✓ Gateway is healthy");
-      break;
-    }
-    if (i === 4) {
-      console.error("  Gateway health check failed. Cleaning up stale state...");
-      destroyGateway();
-      if (exitOnFailure) {
-        console.error("  Stale state removed. Please rerun: nemoclaw onboard");
-        process.exit(1);
-      }
-      throw new Error("Gateway failed to start");
-    }
-    sleep(2);
-  }
+  console.log("  ✓ Gateway is healthy");
 
+  // CoreDNS fix — k3s-inside-Docker has broken DNS forwarding on all platforms.
   const runtime = getContainerRuntime();
   if (shouldPatchCoredns(runtime)) {
-    console.log("  Patching CoreDNS for Colima...");
-    run(`bash "${path.join(SCRIPTS, "fix-coredns.sh")}" ${GATEWAY_NAME} 2>&1 || true`, { ignoreError: true });
+    console.log("  Patching CoreDNS DNS forwarding...");
+    run(`bash "${path.join(SCRIPTS, "fix-coredns.sh")}" ${GATEWAY_NAME} 2>&1 || true`, {
+      ignoreError: true,
+    });
   }
   sleep(5);
   runOpenshell(["gateway", "select", GATEWAY_NAME], { ignoreError: true });
   process.env.OPENSHELL_GATEWAY = GATEWAY_NAME;
 }
 
-async function startGateway(_gpu, _reusingGateway = false) {
+async function startGateway(_gpu) {
   return startGatewayWithOptions(_gpu, { exitOnFailure: true });
 }
 
-async function _startGatewayForRecovery(_gpu, _reusingGateway = false) {
+async function startGatewayForRecovery(_gpu) {
   return startGatewayWithOptions(_gpu, { exitOnFailure: false });
 }
 
@@ -1309,7 +2413,7 @@ function getGatewayStartEnv() {
   return gatewayEnv;
 }
 
-async function _recoverGatewayRuntime() {
+async function recoverGatewayRuntime() {
   runOpenshell(["gateway", "select", GATEWAY_NAME], { ignoreError: true });
   let status = runCaptureOpenshell(["status"], { ignoreError: true });
   if (status.includes("Connected") && isSelectedGateway(status)) {
@@ -1317,113 +2421,106 @@ async function _recoverGatewayRuntime() {
     return true;
   }
 
-  runOpenshell(["gateway", "start", "--name", GATEWAY_NAME], {
+  const startResult = runOpenshell(["gateway", "start", "--name", GATEWAY_NAME], {
     ignoreError: true,
     env: getGatewayStartEnv(),
+    suppressOutput: true,
   });
+  if (startResult.status !== 0) {
+    const diagnostic = compactText(
+      redact(`${startResult.stderr || ""} ${startResult.stdout || ""}`),
+    );
+    console.error(`  Gateway restart failed (exit ${startResult.status}).`);
+    if (diagnostic) {
+      console.error(`  ${diagnostic.slice(0, 240)}`);
+    }
+  }
   runOpenshell(["gateway", "select", GATEWAY_NAME], { ignoreError: true });
 
-  for (let i = 0; i < 5; i++) {
+  const recoveryPollCount = envInt("NEMOCLAW_HEALTH_POLL_COUNT", 10);
+  const recoveryPollInterval = envInt("NEMOCLAW_HEALTH_POLL_INTERVAL", 2);
+  for (let i = 0; i < recoveryPollCount; i++) {
     status = runCaptureOpenshell(["status"], { ignoreError: true });
     if (status.includes("Connected") && isSelectedGateway(status)) {
       process.env.OPENSHELL_GATEWAY = GATEWAY_NAME;
       const runtime = getContainerRuntime();
       if (shouldPatchCoredns(runtime)) {
-        run(`bash "${path.join(SCRIPTS, "fix-coredns.sh")}" ${GATEWAY_NAME} 2>&1 || true`, { ignoreError: true });
+        run(`bash "${path.join(SCRIPTS, "fix-coredns.sh")}" ${GATEWAY_NAME} 2>&1 || true`, {
+          ignoreError: true,
+        });
       }
       return true;
     }
-    sleep(2);
+    if (i < recoveryPollCount - 1) sleep(recoveryPollInterval);
   }
 
   return false;
 }
 
-function shouldIncludeBuildContextPath(sourceRoot, candidatePath) {
-  const relative = path.relative(sourceRoot, candidatePath);
-  if (!relative || relative === "") return true;
-
-  const segments = relative.split(path.sep);
-  const basename = path.basename(candidatePath);
-  const excludedSegments = new Set([
-    ".venv",
-    ".ruff_cache",
-    ".pytest_cache",
-    ".mypy_cache",
-    "__pycache__",
-    "node_modules",
-    ".git",
-  ]);
-
-  if (basename === ".DS_Store" || basename.startsWith("._")) {
-    return false;
-  }
-
-  return !segments.some((segment) => excludedSegments.has(segment));
-}
-
-function copyBuildContextDir(sourceDir, destinationDir) {
-  fs.cpSync(sourceDir, destinationDir, {
-    recursive: true,
-    filter: (candidatePath) => shouldIncludeBuildContextPath(sourceDir, candidatePath),
-  });
-}
-
-function sandboxExistsInGateway(sandboxName) {
-  const output = runCaptureOpenshell(["sandbox", "get", sandboxName], { ignoreError: true });
-  return Boolean(output);
-}
-
-function pruneStaleSandboxEntry(sandboxName) {
-  const existing = registry.getSandbox(sandboxName);
-  const liveExists = sandboxExistsInGateway(sandboxName);
-  if (existing && !liveExists) {
-    console.log(`  Detected stale local sandbox entry for '${sandboxName}'. OpenShell does not have this sandbox, so NemoClaw will recreate it.`);
-    registry.removeSandbox(sandboxName);
-  }
-  return liveExists;
-}
-
 // ── Step 3: Sandbox ──────────────────────────────────────────────
 
 async function promptValidatedSandboxName() {
-  const nameAnswer = await promptOrDefault(
-    "  Sandbox name (lowercase, numbers, hyphens) [my-assistant]: ",
-    "NEMOCLAW_SANDBOX_NAME", "my-assistant"
-  );
-  const sandboxName = (nameAnswer || "my-assistant").trim().toLowerCase();
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const nameAnswer = await promptOrDefault(
+      "  Sandbox name (lowercase, starts with letter, hyphens ok) [my-assistant]: ",
+      "NEMOCLAW_SANDBOX_NAME",
+      "my-assistant",
+    );
+    const sandboxName = (nameAnswer || "my-assistant").trim().toLowerCase();
 
-  // Validate: RFC 1123 subdomain — lowercase alphanumeric and hyphens,
-  // must start and end with alphanumeric (required by Kubernetes/OpenShell)
-  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(sandboxName)) {
+    // Validate: RFC 1123 subdomain — lowercase alphanumeric and hyphens,
+    // must start with a letter (not a digit) to satisfy Kubernetes naming.
+    if (/^[a-z]([a-z0-9-]*[a-z0-9])?$/.test(sandboxName)) {
+      return sandboxName;
+    }
+
     console.error(`  Invalid sandbox name: '${sandboxName}'`);
-    console.error("  Names must be lowercase, contain only letters, numbers, and hyphens,");
-    console.error("  and must start and end with a letter or number.");
-    process.exit(1);
+    if (/^[0-9]/.test(sandboxName)) {
+      console.error("  Names must start with a letter, not a digit.");
+    } else {
+      console.error("  Names must be lowercase, contain only letters, numbers, and hyphens,");
+      console.error("  must start with a letter, and end with a letter or number.");
+    }
+
+    // Non-interactive runs cannot re-prompt — abort so the caller can fix the
+    // NEMOCLAW_SANDBOX_NAME env var and retry.
+    if (isNonInteractive()) {
+      process.exit(1);
+    }
+
+    if (attempt < MAX_ATTEMPTS - 1) {
+      console.error("  Please try again.\n");
+    }
   }
 
-  return sandboxName;
+  console.error("  Too many invalid attempts.");
+  process.exit(1);
 }
 
-async function createSandbox(gpu, model, provider, _preferredInferenceApi = null, sandboxNameOverride = null) {
+// ── Step 5: Sandbox ──────────────────────────────────────────────
+
+// eslint-disable-next-line complexity
+async function createSandbox(
+  gpu,
+  model,
+  provider,
+  preferredInferenceApi = null,
+  sandboxNameOverride = null,
+  webSearchConfig = null,
+) {
   step(5, 7, "Creating sandbox");
 
   const sandboxName = sandboxNameOverride || (await promptValidatedSandboxName());
+  const chatUiUrl = process.env.CHAT_UI_URL || `http://127.0.0.1:${CONTROL_UI_PORT}`;
 
   // Reconcile local registry state with the live OpenShell gateway state.
   const liveExists = pruneStaleSandboxEntry(sandboxName);
 
   if (liveExists) {
-    if (!registry.getSandbox(sandboxName)) {
-      console.log(`  Found existing OpenShell sandbox '${sandboxName}'. Syncing local NemoClaw state before continuing.`);
-      registry.registerSandbox({
-        name: sandboxName,
-        gpuEnabled: !!gpu,
-      });
-    }
-
     const existingSandboxState = getSandboxReuseState(sandboxName);
     if (existingSandboxState === "ready" && process.env.NEMOCLAW_RECREATE_SANDBOX !== "1") {
+      ensureDashboardForward(sandboxName, chatUiUrl);
       if (isNonInteractive()) {
         note(`  [non-interactive] Sandbox '${sandboxName}' exists and is ready — reusing it`);
       } else {
@@ -1449,49 +2546,79 @@ async function createSandbox(gpu, model, provider, _preferredInferenceApi = null
   const stagedDockerfile = path.join(buildCtx, "Dockerfile");
   fs.copyFileSync(path.join(ROOT, "Dockerfile"), stagedDockerfile);
   copyBuildContextDir(path.join(ROOT, "nemoclaw"), path.join(buildCtx, "nemoclaw"));
-  copyBuildContextDir(path.join(ROOT, "nemoclaw-blueprint"), path.join(buildCtx, "nemoclaw-blueprint"));
+  copyBuildContextDir(
+    path.join(ROOT, "nemoclaw-blueprint"),
+    path.join(buildCtx, "nemoclaw-blueprint"),
+  );
   copyBuildContextDir(path.join(ROOT, "scripts"), path.join(buildCtx, "scripts"));
-
-  const controlUiOrigins = getControlUiAllowedOrigins();
-  const wslControlUiOrigin = controlUiOrigins.find(
-    (origin) => origin !== "http://127.0.0.1:18789" && origin !== "http://localhost:18789",
-  );
-  const chatUiUrl = process.env.CHAT_UI_URL || wslControlUiOrigin || "http://127.0.0.1:18789";
-
-  // openclaw.json is generated at image build-time from Dockerfile ARGs.
-  // Update CHAT_UI_URL in the staged Dockerfile so allowedOrigins includes
-  // the Win11-reachable WSL host origin when onboarding under WSL.
-  const stagedDockerfileText = fs.readFileSync(stagedDockerfile, "utf-8");
-  const patchedDockerfileText = stagedDockerfileText.replace(
-    /^ARG CHAT_UI_URL=.*$/m,
-    `ARG CHAT_UI_URL=${chatUiUrl}`,
-  );
-  fs.writeFileSync(stagedDockerfile, patchedDockerfileText, "utf-8");
 
   // Create sandbox (use -- echo to avoid dropping into interactive shell)
   // Pass the base policy so sandbox starts in proxy mode (required for policy updates later)
   const basePolicyPath = path.join(ROOT, "nemoclaw-blueprint", "policies", "openclaw-sandbox.yaml");
   const createArgs = [
-    "--from", `${buildCtx}/Dockerfile`,
-    "--name", sandboxName,
-    "--policy", basePolicyPath,
+    "--from",
+    `${buildCtx}/Dockerfile`,
+    "--name",
+    sandboxName,
+    "--policy",
+    basePolicyPath,
   ];
   // --gpu is intentionally omitted. See comment in startGateway().
 
   console.log(`  Creating sandbox '${sandboxName}' (this takes a few minutes on first run)...`);
+  if (webSearchConfig && !getCredential(webSearch.BRAVE_API_KEY_ENV)) {
+    console.error("  Brave Search is enabled, but BRAVE_API_KEY is not available in this process.");
+    console.error(
+      "  Re-run with BRAVE_API_KEY set, or disable Brave Search before recreating the sandbox.",
+    );
+    process.exit(1);
+  }
+  patchStagedDockerfile(
+    stagedDockerfile,
+    model,
+    chatUiUrl,
+    String(Date.now()),
+    provider,
+    preferredInferenceApi,
+    webSearchConfig,
+  );
+  // Only pass non-sensitive env vars to the sandbox. NVIDIA_API_KEY is NOT
+  // needed inside the sandbox — inference is proxied through the OpenShell
+  // gateway which injects the stored credential server-side. The gateway
+  // also strips any Authorization headers sent by the sandbox client.
+  // See: crates/openshell-sandbox/src/proxy.rs (header stripping),
+  //      crates/openshell-router/src/backend.rs (server-side auth injection).
+  const envArgs = [formatEnvAssignment("CHAT_UI_URL", chatUiUrl)];
   const sandboxEnv = { ...process.env };
-  sandboxEnv.CHAT_UI_URL = chatUiUrl;
-
+  delete sandboxEnv.NVIDIA_API_KEY;
+  const discordToken = getCredential("DISCORD_BOT_TOKEN") || process.env.DISCORD_BOT_TOKEN;
+  if (discordToken) {
+    sandboxEnv.DISCORD_BOT_TOKEN = discordToken;
+  }
+  const slackToken = getCredential("SLACK_BOT_TOKEN") || process.env.SLACK_BOT_TOKEN;
+  if (slackToken) {
+    sandboxEnv.SLACK_BOT_TOKEN = slackToken;
+  }
   // Run without piping through awk — the pipe masked non-zero exit codes
   // from openshell because bash returns the status of the last pipeline
   // command (awk, always 0) unless pipefail is set. Removing the pipe
   // lets the real exit code flow through to run().
-  // Launch nemoclaw-start in the background and return immediately so
-  // `openshell sandbox create` can finish once the sandbox is ready.
-  // Passing a foreground gateway command here causes the create stream to hang.
-  const backgroundStart = shellQuote(`nohup /usr/local/bin/nemoclaw-start >/tmp/gateway.log 2>&1 &`);
-  const createCommand = `openshell sandbox create ${createArgs.join(" ")} -- env CHAT_UI_URL=${shellQuote(chatUiUrl)} bash -lc ${backgroundStart} 2>&1`;
-  const createResult = await streamSandboxCreate(createCommand, sandboxEnv, { ignoreError: true });
+  const createCommand = `${openshellShellCommand([
+    "sandbox",
+    "create",
+    ...createArgs,
+    "--",
+    "env",
+    ...envArgs,
+    "nemoclaw-start",
+  ])} 2>&1`;
+  const createResult = await streamSandboxCreate(createCommand, sandboxEnv, {
+    readyCheck: () => {
+      const list = runCaptureOpenshell(["sandbox", "list"], { ignoreError: true });
+      return isSandboxReady(list, sandboxName);
+    },
+  });
+
   // Clean up build context regardless of outcome
   run(`rm -rf "${buildCtx}"`, { ignoreError: true });
 
@@ -1519,7 +2646,7 @@ async function createSandbox(gpu, model, provider, _preferredInferenceApi = null
       ready = true;
       break;
     }
-    require("child_process").spawnSync("sleep", ["2"]);
+    sleep(2);
   }
 
   if (!ready) {
@@ -1538,12 +2665,30 @@ async function createSandbox(gpu, model, provider, _preferredInferenceApi = null
     process.exit(1);
   }
 
+  // Wait for NemoClaw dashboard to become fully ready (web server live)
+  // This prevents port forwards from connecting to a non-existent port
+  // or seeing 502/503 errors during initial load.
+  console.log("  Waiting for NemoClaw dashboard to become ready...");
+  for (let i = 0; i < 15; i++) {
+    const readyMatch = runCapture(
+      `openshell sandbox exec ${sandboxName} curl -sf http://localhost:18789/ 2>/dev/null || echo "no"`,
+      { ignoreError: true },
+    );
+    if (readyMatch && !readyMatch.includes("no")) {
+      console.log("  ✓ Dashboard is live");
+      break;
+    }
+    if (i === 14) {
+      console.warn("  Dashboard taking longer than expected to start. Continuing...");
+    } else {
+      sleep(2);
+    }
+  }
+
   // Release any stale forward on port 18789 before claiming it for the new sandbox.
   // A previous onboard run may have left the port forwarded to a different sandbox,
   // which would silently prevent the new sandbox's dashboard from being reachable.
-  runOpenshell(["forward", "stop", "18789"], { ignoreError: true });
-  // Forward dashboard port to the new sandbox
-  run(getDashboardForwardStartCommand(sandboxName), { ignoreError: true });
+  ensureDashboardForward(sandboxName, chatUiUrl);
 
   // Register only after confirmed ready — prevents phantom entries
   registry.registerSandbox({
@@ -1551,493 +2696,684 @@ async function createSandbox(gpu, model, provider, _preferredInferenceApi = null
     gpuEnabled: !!gpu,
   });
 
+  // DNS proxy — run a forwarder in the sandbox pod so the isolated
+  // sandbox namespace can resolve hostnames (fixes #626).
+  console.log("  Setting up sandbox DNS proxy...");
+  run(
+    `bash "${path.join(SCRIPTS, "setup-dns-proxy.sh")}" ${GATEWAY_NAME} "${sandboxName}" 2>&1 || true`,
+    { ignoreError: true },
+  );
+
   console.log(`  ✓ Sandbox '${sandboxName}' created`);
   return sandboxName;
 }
 
-// ── Step 4: NIM ──────────────────────────────────────────────────
+// ── Step 3: Inference selection ──────────────────────────────────
 
 // eslint-disable-next-line complexity
-async function setupNim(sandboxName, _gpu) {
-  step(4, 7, "Configuring inference (NIM)");
+async function setupNim(gpu) {
+  step(3, 7, "Configuring inference (NIM)");
 
-  let model;
-  let provider;
+  let model = null;
+  let provider = REMOTE_PROVIDER_CONFIG.build.providerName;
   let nimContainer = null;
-  let providerBaseUrl;
-  let endpointUrl;
-  let preferredInferenceApi;
-  let ollamaEndpoint = resolveOllamaEndpoint(runCapture);
+  let endpointUrl = REMOTE_PROVIDER_CONFIG.build.endpointUrl;
+  let credentialEnv = REMOTE_PROVIDER_CONFIG.build.credentialEnv;
+  let preferredInferenceApi = null;
 
   // Detect local inference options
   const hasOllama = !!runCapture("command -v ollama", { ignoreError: true });
-  const ollamaRunning = !!ollamaEndpoint;
-  const vllmRunning = !!runCapture("curl -sf http://localhost:8000/v1/models 2>/dev/null", { ignoreError: true });
+  const ollamaRunning = !!runCapture("curl -sf http://localhost:11434/api/tags 2>/dev/null", {
+    ignoreError: true,
+  });
+  const vllmRunning = !!runCapture("curl -sf http://localhost:8000/v1/models 2>/dev/null", {
+    ignoreError: true,
+  });
   const requestedProvider = isNonInteractive() ? getNonInteractiveProvider() : null;
-  const requestedModel = isNonInteractive() ? getNonInteractiveModel(requestedProvider || "nvidia-prod") : null;
-
-  const providerOptions = [
-    { key: "nvidia-prod", label: "NVIDIA Endpoints" },
-    { key: "openai-api", label: "OpenAI" },
-    { key: "compatible-endpoint", label: "Other OpenAI-compatible endpoint" },
-    { key: "anthropic-prod", label: "Anthropic" },
-    { key: "compatible-anthropic-endpoint", label: "Other Anthropic-compatible endpoint" },
-    { key: "gemini-api", label: "Google Gemini" },
-    { key: "ollama-local", label: "Local Ollama" },
-    { key: "vllm-local", label: "Local vLLM" },
-  ];
-
-  const parseModelIds = (payload) => {
-    if (!payload || !Array.isArray(payload.data)) return [];
-    return payload.data.map((item) => item && item.id).filter(Boolean);
-  };
-
-  const validateModelInCatalog = (catalogUrl, authHeader, modelId, providerLabel) => {
-    const probe = runCurlJson(catalogUrl, {
-      method: "GET",
-      headers: [authHeader],
+  const requestedModel = isNonInteractive()
+    ? getNonInteractiveModel(requestedProvider || "build")
+    : null;
+  const options = [];
+  options.push({ key: "build", label: "NVIDIA Endpoints" });
+  options.push({ key: "openai", label: "OpenAI" });
+  options.push({ key: "custom", label: "Other OpenAI-compatible endpoint" });
+  options.push({ key: "anthropic", label: "Anthropic" });
+  options.push({ key: "anthropicCompatible", label: "Other Anthropic-compatible endpoint" });
+  options.push({ key: "gemini", label: "Google Gemini" });
+  if (hasOllama || ollamaRunning) {
+    options.push({
+      key: "ollama",
+      label:
+        `Local Ollama (localhost:11434)${ollamaRunning ? " — running" : ""}` +
+        (ollamaRunning ? " (suggested)" : ""),
     });
-    const ids = parseModelIds(probe.json);
-    if (!ids.includes(modelId)) {
-      console.log(`  '${modelId}' is not available from ${providerLabel}. Please try again.`);
-      return false;
-    }
-    return true;
-  };
+  }
+  if (EXPERIMENTAL && gpu && gpu.nimCapable) {
+    options.push({ key: "nim-local", label: "Local NVIDIA NIM [experimental]" });
+  }
+  if (EXPERIMENTAL && vllmRunning) {
+    options.push({
+      key: "vllm",
+      label: "Local vLLM [experimental] — running",
+    });
+  }
+  // On macOS without Ollama, offer to install it
+  if (!hasOllama && process.platform === "darwin") {
+    options.push({ key: "install-ollama", label: "Install Ollama (macOS)" });
+  }
 
-  while (true) {
-    let selected;
-
-    if (isNonInteractive()) {
-      selected = providerOptions.find((option) => option.key === (requestedProvider || "nvidia-prod")) || providerOptions[0];
-      console.log(`  [non-interactive] Provider: ${selected.key}`);
-    } else {
-      const suggestions = [];
-      if (vllmRunning) suggestions.push("vLLM");
-      if (ollamaRunning || hasOllama) suggestions.push("Ollama");
-      if (suggestions.length > 0) {
-        console.log(`  Detected local inference option${suggestions.length > 1 ? "s" : ""}: ${suggestions.join(", ")}`);
-        console.log("  Press Enter to keep NVIDIA Endpoints.");
-        console.log("");
-      }
-
-      console.log("  Inference options:");
-      providerOptions.forEach((option, index) => {
-        console.log(`    ${index + 1}) ${option.label}`);
-      });
-      console.log("");
-
-      const choice = await prompt("  Choose [1]: ");
-      const index = parseInt(choice || "1", 10) - 1;
-      selected = providerOptions[index] || providerOptions[0];
-    }
-
-    if (selected.key === "nvidia-prod") {
-      provider = "nvidia-prod";
-      preferredInferenceApi = "openai-responses";
-      endpointUrl = "https://integrate.api.nvidia.com/v1";
-      if (!isNonInteractive()) await ensureApiKey();
-      const cloudModels = [...CLOUD_MODEL_OPTIONS, { id: null, label: "Other..." }];
-      if (!isNonInteractive()) {
-        console.log("  Cloud models:");
-        cloudModels.forEach((option, index) => {
-          console.log(`    ${index + 1}) ${option.label}${option.id ? ` (${option.id})` : ""}`);
-        });
-        console.log("");
-      }
+  if (options.length > 1) {
+    selectionLoop: while (true) {
+      let selected;
 
       if (isNonInteractive()) {
-        model = requestedModel || DEFAULT_CLOUD_MODEL;
-      } else {
-        const modelChoice = await prompt("  Choose model [1]: ");
-        const modelIndex = parseInt(modelChoice || "1", 10) - 1;
-        const selection = cloudModels[modelIndex] || cloudModels[0];
-        if (selection.id) {
-          model = selection.id;
-        } else {
-          while (true) {
-            const manual = await prompt("  NVIDIA Endpoints model id: ");
-            if (!isSafeModelId(manual)) continue;
-            if (validateModelInCatalog("https://integrate.api.nvidia.com/v1/models", `Authorization: Bearer ${process.env.NVIDIA_API_KEY || ""}`, manual, "NVIDIA Endpoints")) {
-              model = manual;
-              break;
-            }
-          }
-        }
-      }
-      if (!model) model = DEFAULT_CLOUD_MODEL;
-      console.log("  Responses API available");
-      break;
-    }
-
-    if (selected.key === "openai-api") {
-      provider = "openai-api";
-      preferredInferenceApi = "openai-responses";
-      endpointUrl = "https://api.openai.com/v1";
-      const openAiModels = [
-        { id: "gpt-5.4", label: "GPT-5.4" },
-        { id: "gpt-5.4-mini", label: "GPT-5.4 Mini" },
-        { id: "gpt-4.1", label: "GPT-4.1" },
-        { id: "gpt-4o", label: "GPT-4o" },
-        { id: null, label: "Other..." },
-      ];
-      if (!isNonInteractive()) {
-        console.log("  OpenAI models:");
-        openAiModels.forEach((option, index) => {
-          console.log(`    ${index + 1}) ${option.label}${option.id ? ` (${option.id})` : ""}`);
-        });
-        console.log("");
-      }
-
-      if (isNonInteractive()) {
-        model = requestedModel || openAiModels[0].id;
-      } else {
-        const modelChoice = await prompt("  Choose model [1]: ");
-        const modelIndex = parseInt(modelChoice || "1", 10) - 1;
-        const selection = openAiModels[modelIndex] || openAiModels[0];
-        if (selection.id) {
-          model = selection.id;
-        } else {
-          while (true) {
-            const manual = await prompt("  OpenAI model id: ");
-            if (!isSafeModelId(manual)) continue;
-            if (validateModelInCatalog("https://api.openai.com/v1/models", `Authorization: Bearer ${process.env.OPENAI_API_KEY || ""}`, manual, "OpenAI")) {
-              model = manual;
-              break;
-            }
-          }
-        }
-      }
-
-      const validation = runCurlJson("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: [
-          `Authorization: Bearer ${process.env.OPENAI_API_KEY || ""}`,
-          "Content-Type: application/json",
-        ],
-        body: { model, input: "ping" },
-      });
-      if (!validation.ok && !isNonInteractive()) {
-        console.error("  OpenAI endpoint validation failed");
-        console.error("  Please choose a provider/model again");
-        continue;
-      }
-      console.log("  Responses API available");
-      break;
-    }
-
-    if (selected.key === "compatible-endpoint") {
-      provider = "compatible-endpoint";
-      preferredInferenceApi = "openai-responses";
-      const baseUrl = normalizeBaseUrl(await prompt("  OpenAI-compatible base URL: "));
-      endpointUrl = baseUrl;
-      while (true) {
-        const manual = await prompt("  Other OpenAI-compatible endpoint model: ");
-        if (!isSafeModelId(manual)) continue;
-        const validation = runCurlJson(`${baseUrl}/responses`, {
-          method: "POST",
-          headers: [
-            `Authorization: Bearer ${process.env.COMPATIBLE_API_KEY || ""}`,
-            "Content-Type: application/json",
-          ],
-          body: { model: manual, input: "ping" },
-        });
-        if (validation.ok) {
-          model = manual;
-          break;
-        }
-        if (isNonInteractive()) {
-          console.error("  Other OpenAI-compatible endpoint endpoint validation failed");
+        const providerKey = requestedProvider || "build";
+        selected = options.find((o) => o.key === providerKey);
+        if (!selected) {
+          console.error(
+            `  Requested provider '${providerKey}' is not available in this environment.`,
+          );
           process.exit(1);
         }
-        console.error("  Other OpenAI-compatible endpoint endpoint validation failed");
-        console.error("  Please enter a different Other OpenAI-compatible endpoint model name.");
-      }
-      break;
-    }
+        note(`  [non-interactive] Provider: ${selected.key}`);
+      } else {
+        const suggestions = [];
+        if (vllmRunning) suggestions.push("vLLM");
+        if (ollamaRunning) suggestions.push("Ollama");
+        if (suggestions.length > 0) {
+          console.log(
+            `  Detected local inference option${suggestions.length > 1 ? "s" : ""}: ${suggestions.join(", ")}`,
+          );
+          console.log("");
+        }
 
-    if (selected.key === "anthropic-prod") {
-      provider = "anthropic-prod";
-      preferredInferenceApi = "anthropic-messages";
-      endpointUrl = "https://api.anthropic.com";
-      const anthropicModels = [
-        { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-        { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
-        { id: "claude-3-opus-20240229", label: "Claude 3 Opus" },
-        { id: null, label: "Other..." },
-      ];
-
-      if (!isNonInteractive()) {
-        console.log("  Anthropic models:");
-        anthropicModels.forEach((option, index) => {
-          console.log(`    ${index + 1}) ${option.label}${option.id ? ` (${option.id})` : ""}`);
+        console.log("");
+        console.log("  Inference options:");
+        options.forEach((o, i) => {
+          console.log(`    ${i + 1}) ${o.label}`);
         });
         console.log("");
+
+        const defaultIdx = options.findIndex((o) => o.key === "build") + 1;
+        const choice = await prompt(`  Choose [${defaultIdx}]: `);
+        const idx = parseInt(choice || String(defaultIdx), 10) - 1;
+        selected = options[idx] || options[defaultIdx - 1];
       }
 
-      if (isNonInteractive()) {
-        model = requestedModel || anthropicModels[0].id;
-      } else {
-        const modelChoice = await prompt("  Choose model [1]: ");
-        const modelIndex = parseInt(modelChoice || "1", 10) - 1;
-        const selection = anthropicModels[modelIndex] || anthropicModels[0];
-        if (selection.id) {
-          model = selection.id;
+      if (REMOTE_PROVIDER_CONFIG[selected.key]) {
+        const remoteConfig = REMOTE_PROVIDER_CONFIG[selected.key];
+        provider = remoteConfig.providerName;
+        credentialEnv = remoteConfig.credentialEnv;
+        endpointUrl = remoteConfig.endpointUrl;
+        preferredInferenceApi = null;
+
+        if (selected.key === "custom") {
+          const endpointInput = isNonInteractive()
+            ? (process.env.NEMOCLAW_ENDPOINT_URL || "").trim()
+            : await prompt("  OpenAI-compatible base URL (e.g., https://openrouter.ai/api/v1): ");
+          const navigation = getNavigationChoice(endpointInput);
+          if (navigation === "back") {
+            console.log("  Returning to provider selection.");
+            console.log("");
+            continue selectionLoop;
+          }
+          if (navigation === "exit") {
+            exitOnboardFromPrompt();
+          }
+          endpointUrl = normalizeProviderBaseUrl(endpointInput, "openai");
+          if (!endpointUrl) {
+            console.error("  Endpoint URL is required for Other OpenAI-compatible endpoint.");
+            if (isNonInteractive()) {
+              process.exit(1);
+            }
+            console.log("");
+            continue selectionLoop;
+          }
+        } else if (selected.key === "anthropicCompatible") {
+          const endpointInput = isNonInteractive()
+            ? (process.env.NEMOCLAW_ENDPOINT_URL || "").trim()
+            : await prompt("  Anthropic-compatible base URL (e.g., https://proxy.example.com): ");
+          const navigation = getNavigationChoice(endpointInput);
+          if (navigation === "back") {
+            console.log("  Returning to provider selection.");
+            console.log("");
+            continue selectionLoop;
+          }
+          if (navigation === "exit") {
+            exitOnboardFromPrompt();
+          }
+          endpointUrl = normalizeProviderBaseUrl(endpointInput, "anthropic");
+          if (!endpointUrl) {
+            console.error("  Endpoint URL is required for Other Anthropic-compatible endpoint.");
+            if (isNonInteractive()) {
+              process.exit(1);
+            }
+            console.log("");
+            continue selectionLoop;
+          }
+        }
+
+        if (selected.key === "build") {
+          if (isNonInteractive()) {
+            if (!process.env.NVIDIA_API_KEY) {
+              console.error(
+                "  NVIDIA_API_KEY is required for NVIDIA Endpoints in non-interactive mode.",
+              );
+              process.exit(1);
+            }
+          } else {
+            await ensureApiKey();
+          }
+          model =
+            requestedModel ||
+            (isNonInteractive() ? DEFAULT_CLOUD_MODEL : await promptCloudModel()) ||
+            DEFAULT_CLOUD_MODEL;
+          if (model === BACK_TO_SELECTION) {
+            console.log("  Returning to provider selection.");
+            console.log("");
+            continue selectionLoop;
+          }
         } else {
+          if (isNonInteractive()) {
+            if (!process.env[credentialEnv]) {
+              console.error(
+                `  ${credentialEnv} is required for ${remoteConfig.label} in non-interactive mode.`,
+              );
+              process.exit(1);
+            }
+          } else {
+            await ensureNamedCredential(
+              credentialEnv,
+              remoteConfig.label + " API key",
+              remoteConfig.helpUrl,
+            );
+          }
+          const defaultModel = requestedModel || remoteConfig.defaultModel;
+          let modelValidator = null;
+          if (selected.key === "openai" || selected.key === "gemini") {
+            modelValidator = (candidate) =>
+              validateOpenAiLikeModel(
+                remoteConfig.label,
+                endpointUrl,
+                candidate,
+                getCredential(credentialEnv),
+              );
+          } else if (selected.key === "anthropic") {
+            modelValidator = (candidate) =>
+              validateAnthropicModel(
+                endpointUrl || ANTHROPIC_ENDPOINT_URL,
+                candidate,
+                getCredential(credentialEnv),
+              );
+          }
           while (true) {
-            const manual = await prompt("  Anthropic model id: ");
-            if (!isSafeModelId(manual)) continue;
-            if (validateModelInCatalog("https://api.anthropic.com/v1/models", `x-api-key: ${process.env.ANTHROPIC_API_KEY || ""}`, manual, "Anthropic")) {
-              model = manual;
-              break;
+            if (isNonInteractive()) {
+              model = defaultModel;
+            } else if (remoteConfig.modelMode === "curated") {
+              model = await promptRemoteModel(
+                remoteConfig.label,
+                selected.key,
+                defaultModel,
+                modelValidator,
+              );
+            } else {
+              model = await promptInputModel(remoteConfig.label, defaultModel, modelValidator);
+            }
+            if (model === BACK_TO_SELECTION) {
+              console.log("  Returning to provider selection.");
+              console.log("");
+              continue selectionLoop;
+            }
+
+            if (selected.key === "custom") {
+              const validation = await validateCustomOpenAiLikeSelection(
+                remoteConfig.label,
+                endpointUrl,
+                model,
+                credentialEnv,
+                remoteConfig.helpUrl,
+              );
+              if (validation.ok) {
+                preferredInferenceApi = validation.api;
+                break;
+              }
+              if (
+                validation.retry === "credential" ||
+                validation.retry === "retry" ||
+                validation.retry === "model"
+              ) {
+                continue;
+              }
+              if (validation.retry === "selection") {
+                continue selectionLoop;
+              }
+            } else if (selected.key === "anthropicCompatible") {
+              const validation = await validateCustomAnthropicSelection(
+                remoteConfig.label,
+                endpointUrl || ANTHROPIC_ENDPOINT_URL,
+                model,
+                credentialEnv,
+                remoteConfig.helpUrl,
+              );
+              if (validation.ok) {
+                preferredInferenceApi = validation.api;
+                break;
+              }
+              if (
+                validation.retry === "credential" ||
+                validation.retry === "retry" ||
+                validation.retry === "model"
+              ) {
+                continue;
+              }
+              if (validation.retry === "selection") {
+                continue selectionLoop;
+              }
+            } else {
+              const retryMessage = "Please choose a provider/model again.";
+              if (selected.key === "anthropic") {
+                const validation = await validateAnthropicSelectionWithRetryMessage(
+                  remoteConfig.label,
+                  endpointUrl || ANTHROPIC_ENDPOINT_URL,
+                  model,
+                  credentialEnv,
+                  retryMessage,
+                  remoteConfig.helpUrl,
+                );
+                if (validation.ok) {
+                  preferredInferenceApi = validation.api;
+                  break;
+                }
+                if (
+                  validation.retry === "credential" ||
+                  validation.retry === "retry" ||
+                  validation.retry === "model"
+                ) {
+                  continue;
+                }
+              } else {
+                const validation = await validateOpenAiLikeSelection(
+                  remoteConfig.label,
+                  endpointUrl,
+                  model,
+                  credentialEnv,
+                  retryMessage,
+                  remoteConfig.helpUrl,
+                );
+                if (validation.ok) {
+                  preferredInferenceApi = validation.api;
+                  break;
+                }
+                if (
+                  validation.retry === "credential" ||
+                  validation.retry === "retry" ||
+                  validation.retry === "model"
+                ) {
+                  continue;
+                }
+              }
+              continue selectionLoop;
             }
           }
         }
-      }
 
-      const validation = runCurlJson("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: [
-          `x-api-key: ${process.env.ANTHROPIC_API_KEY || ""}`,
-          "anthropic-version: 2023-06-01",
-          "Content-Type: application/json",
-        ],
-        body: {
-          model,
-          max_tokens: 16,
-          messages: [{ role: "user", content: "ping" }],
-        },
-      });
-      if (!validation.ok && !isNonInteractive()) {
-        console.error("  Anthropic endpoint validation failed");
-        console.error("  Please choose a provider/model again");
-        continue;
-      }
-      break;
-    }
-
-    if (selected.key === "compatible-anthropic-endpoint") {
-      provider = "compatible-anthropic-endpoint";
-      preferredInferenceApi = "anthropic-messages";
-      const baseUrl = normalizeBaseUrl(await prompt("  Anthropic-compatible base URL: "));
-      endpointUrl = baseUrl;
-      while (true) {
-        const manual = await prompt("  Other Anthropic-compatible endpoint model: ");
-        if (!isSafeModelId(manual)) continue;
-        const validation = runCurlJson(`${baseUrl}/v1/messages`, {
-          method: "POST",
-          headers: [
-            `x-api-key: ${process.env.COMPATIBLE_ANTHROPIC_API_KEY || ""}`,
-            "anthropic-version: 2023-06-01",
-            "Content-Type: application/json",
-          ],
-          body: {
-            model: manual,
-            max_tokens: 16,
-            messages: [{ role: "user", content: "ping" }],
-          },
-        });
-        if (validation.ok) {
-          model = manual;
-          console.log("  Anthropic Messages API available");
-          break;
-        }
-        if (isNonInteractive()) {
-          console.error("  Other Anthropic-compatible endpoint endpoint validation failed");
-          process.exit(1);
-        }
-        console.error("  Other Anthropic-compatible endpoint endpoint validation failed");
-        console.error("  Please enter a different Other Anthropic-compatible endpoint model name.");
-      }
-      break;
-    }
-
-    if (selected.key === "gemini-api") {
-      provider = "gemini-api";
-      endpointUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
-      const geminiModels = [
-        { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-        { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-        { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
-        { id: "gemini-1.5-pro", label: "Gemini 1.5 Pro" },
-        { id: "gemini-1.0-pro", label: "Gemini 1.0 Pro" },
-        { id: "gemini-1.0-pro-vision", label: "Gemini 1.0 Pro Vision" },
-        { id: null, label: "Other..." },
-      ];
-      if (!isNonInteractive()) {
-        console.log("  Google Gemini models:");
-        geminiModels.forEach((option, index) => {
-          console.log(`    ${index + 1}) ${option.label}${option.id ? ` (${option.id})` : ""}`);
-        });
-        console.log("");
-      }
-      if (isNonInteractive()) {
-        model = requestedModel || geminiModels[0].id;
-      } else {
-        const modelChoice = await prompt("  Choose model [5]: ");
-        const modelIndex = parseInt(modelChoice || "5", 10) - 1;
-        const selection = geminiModels[modelIndex] || geminiModels[4];
-        if (selection.id) {
-          model = selection.id;
-        } else {
+        if (selected.key === "build") {
           while (true) {
-            const manual = await prompt("  Google Gemini model id: ");
-            if (!isSafeModelId(manual)) continue;
-            model = manual;
-            break;
+            const validation = await validateOpenAiLikeSelection(
+              remoteConfig.label,
+              endpointUrl,
+              model,
+              credentialEnv,
+              "Please choose a provider/model again.",
+              remoteConfig.helpUrl,
+            );
+            if (validation.ok) {
+              preferredInferenceApi = validation.api;
+              break;
+            }
+            if (validation.retry === "credential" || validation.retry === "retry") {
+              continue;
+            }
+            continue selectionLoop;
           }
         }
-      }
 
-      const responsesProbe = runCurlJson("https://generativelanguage.googleapis.com/v1beta/openai/responses", {
-        method: "POST",
-        headers: [
-          `Authorization: Bearer ${process.env.GEMINI_API_KEY || ""}`,
-          "Content-Type: application/json",
-        ],
-        body: { model, input: "ping" },
-      });
-      if (responsesProbe.ok) {
-        preferredInferenceApi = "openai-responses";
-        console.log("  Responses API available");
+        console.log(`  Using ${remoteConfig.label} with model: ${model}`);
         break;
-      }
+      } else if (selected.key === "nim-local") {
+        // List models that fit GPU VRAM
+        const models = nim.listModels().filter((m) => m.minGpuMemoryMB <= gpu.totalMemoryMB);
+        if (models.length === 0) {
+          console.log("  No NIM models fit your GPU VRAM. Falling back to cloud API.");
+        } else {
+          let sel;
+          if (isNonInteractive()) {
+            if (requestedModel) {
+              sel = models.find((m) => m.name === requestedModel);
+              if (!sel) {
+                console.error(`  Unsupported NEMOCLAW_MODEL for NIM: ${requestedModel}`);
+                process.exit(1);
+              }
+            } else {
+              sel = models[0];
+            }
+            note(`  [non-interactive] NIM model: ${sel.name}`);
+          } else {
+            console.log("");
+            console.log("  Models that fit your GPU:");
+            models.forEach((m, i) => {
+              console.log(`    ${i + 1}) ${m.name} (min ${m.minGpuMemoryMB} MB)`);
+            });
+            console.log("");
 
-      const completionsProbe = runCurlJson("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
-        method: "POST",
-        headers: [
-          `Authorization: Bearer ${process.env.GEMINI_API_KEY || ""}`,
-          "Content-Type: application/json",
-        ],
-        body: {
-          model,
-          messages: [{ role: "user", content: "ping" }],
-        },
-      });
-      if (!completionsProbe.ok && !isNonInteractive()) {
-        console.error("  Gemini endpoint validation failed");
-        console.error("  Please choose a provider/model again");
-        continue;
-      }
-      preferredInferenceApi = "openai-completions";
-      console.log("  Chat Completions API available");
-      break;
-    }
+            const modelChoice = await prompt(`  Choose model [1]: `);
+            const midx = parseInt(modelChoice || "1", 10) - 1;
+            sel = models[midx] || models[0];
+          }
+          model = sel.name;
 
-    if (selected.key === "ollama-local") {
-      provider = "ollama-local";
-      preferredInferenceApi = "openai-responses";
-      ollamaEndpoint = resolveOllamaEndpoint(runCapture) || ollamaEndpoint;
-      const ollamaHostBase = ollamaEndpoint?.hostUrl || "http://localhost:11434";
-      endpointUrl = ollamaEndpoint?.openaiBaseUrl || `${ollamaHostBase}/v1`;
+          console.log(`  Pulling NIM image for ${model}...`);
+          nim.pullNimImage(model);
 
-      let ollamaModels;
-      try {
-        const tagsRaw = runCapture(`curl -sf ${shellQuote(`${ollamaHostBase}/api/tags`)} 2>/dev/null`, { ignoreError: true });
-        const tags = tagsRaw ? JSON.parse(tagsRaw) : { models: [] };
-        ollamaModels = Array.isArray(tags.models) ? tags.models.map((entry) => entry && entry.name).filter(Boolean) : [];
-      } catch {
-        ollamaModels = [];
-      }
-      if (ollamaModels.length === 0) {
-        console.log("  No local Ollama models are installed yet");
-        const starterModels = ["qwen2.5:7b", "Other..."];
+          console.log("  Starting NIM container...");
+          nimContainer = nim.startNimContainerByName(nim.containerName(GATEWAY_NAME), model);
+
+          console.log("  Waiting for NIM to become healthy...");
+          if (!nim.waitForNimHealth()) {
+            console.error("  NIM failed to start. Falling back to cloud API.");
+            model = null;
+            nimContainer = null;
+          } else {
+            provider = "vllm-local";
+            credentialEnv = "OPENAI_API_KEY";
+            endpointUrl = getLocalProviderBaseUrl(provider);
+            const validation = await validateOpenAiLikeSelection(
+              "Local NVIDIA NIM",
+              endpointUrl,
+              model,
+              credentialEnv,
+            );
+            if (
+              validation.retry === "selection" ||
+              validation.retry === "back" ||
+              validation.retry === "model"
+            ) {
+              continue selectionLoop;
+            }
+            if (!validation.ok) {
+              continue selectionLoop;
+            }
+            preferredInferenceApi = validation.api;
+            // NIM uses vLLM internally — same tool-call-parser limitation
+            // applies to /v1/responses. Force chat completions.
+            if (preferredInferenceApi !== "openai-completions") {
+              console.log(
+                "  ℹ Using chat completions API (tool-call-parser requires /v1/chat/completions)",
+              );
+            }
+            preferredInferenceApi = "openai-completions";
+          }
+        }
+        break;
+      } else if (selected.key === "ollama") {
+        if (!ollamaRunning) {
+          console.log("  Starting Ollama...");
+          // On WSL2, binding to 0.0.0.0 creates a dual-stack socket that Docker
+          // cannot reach via host-gateway. The default 127.0.0.1 binding works
+          // because WSL2 relays IPv4-only sockets to the Windows host.
+          const ollamaEnv = isWsl() ? "" : "OLLAMA_HOST=0.0.0.0:11434 ";
+          run(`${ollamaEnv}ollama serve > /dev/null 2>&1 &`, { ignoreError: true });
+          sleep(2);
+        }
+        console.log("  ✓ Using Ollama on localhost:11434");
+        provider = "ollama-local";
+        credentialEnv = "OPENAI_API_KEY";
+        endpointUrl = getLocalProviderBaseUrl(provider);
         while (true) {
-          console.log("  Ollama starter models:");
-          starterModels.forEach((entry, index) => {
-            console.log(`    ${index + 1}) ${entry}`);
-          });
-          const starterChoice = await prompt("  Choose model [1]: ");
-          const starterIndex = parseInt(starterChoice || "1", 10) - 1;
-          const starterSelection = starterModels[starterIndex] || starterModels[0];
-          const candidate = starterSelection === "Other..." ? await prompt("  Ollama model id: ") : starterSelection;
-          if (!isSafeModelId(candidate)) continue;
-          console.log(`  Pulling Ollama model: ${candidate}`);
-          const pullResult = run(`ollama pull ${shellQuote(candidate)}`, { ignoreError: true });
-          if (pullResult.status !== 0) {
-            console.error(`  Failed to pull Ollama model '${candidate}'`);
-            console.error("  Choose a different Ollama model or select Other.");
+          const installedModels = getInstalledOllamaModels(runCapture);
+          if (isNonInteractive()) {
+            model = requestedModel || getDefaultOllamaModel(runCapture, gpu);
+          } else {
+            model = await promptOllamaModel(gpu);
+          }
+          const probe = prepareOllamaModel(model, installedModels);
+          if (!probe.ok) {
+            console.error(`  ${probe.message}`);
+            if (isNonInteractive()) {
+              process.exit(1);
+            }
+            console.log("  Choose a different Ollama model or select Other.");
+            console.log("");
             continue;
           }
-          model = candidate;
+          const validation = await validateOpenAiLikeSelection(
+            "Local Ollama",
+            getLocalProviderValidationBaseUrl(provider),
+            model,
+            null,
+            "Choose a different Ollama model or select Other.",
+          );
+          if (validation.retry === "selection" || validation.retry === "back") {
+            continue selectionLoop;
+          }
+          if (!validation.ok) {
+            continue;
+          }
+          // Ollama's /v1/responses endpoint does not produce correctly
+          // formatted tool calls — force chat completions like vLLM/NIM.
+          if (validation.api !== "openai-completions") {
+            console.log(
+              "  ℹ Using chat completions API (Ollama tool calls require /v1/chat/completions)",
+            );
+          }
+          preferredInferenceApi = "openai-completions";
           break;
         }
-      } else {
-        console.log("  Ollama models:");
-        ollamaModels.forEach((entry, index) => {
-          console.log(`    ${index + 1}) ${entry}`);
+        break;
+      } else if (selected.key === "install-ollama") {
+        // macOS only — this option is gated by process.platform === "darwin" above
+        console.log("  Installing Ollama via Homebrew...");
+        run("brew install ollama", { ignoreError: true });
+        console.log("  Starting Ollama...");
+        run("OLLAMA_HOST=0.0.0.0:11434 ollama serve > /dev/null 2>&1 &", { ignoreError: true });
+        sleep(2);
+        console.log("  ✓ Using Ollama on localhost:11434");
+        provider = "ollama-local";
+        credentialEnv = "OPENAI_API_KEY";
+        endpointUrl = getLocalProviderBaseUrl(provider);
+        while (true) {
+          const installedModels = getInstalledOllamaModels(runCapture);
+          if (isNonInteractive()) {
+            model = requestedModel || getDefaultOllamaModel(runCapture, gpu);
+          } else {
+            model = await promptOllamaModel(gpu);
+          }
+          const probe = prepareOllamaModel(model, installedModels);
+          if (!probe.ok) {
+            console.error(`  ${probe.message}`);
+            if (isNonInteractive()) {
+              process.exit(1);
+            }
+            console.log("  Choose a different Ollama model or select Other.");
+            console.log("");
+            continue;
+          }
+          const validation = await validateOpenAiLikeSelection(
+            "Local Ollama",
+            getLocalProviderValidationBaseUrl(provider),
+            model,
+            null,
+            "Choose a different Ollama model or select Other.",
+          );
+          if (validation.retry === "selection" || validation.retry === "back") {
+            continue selectionLoop;
+          }
+          if (!validation.ok) {
+            continue;
+          }
+          // Ollama's /v1/responses endpoint does not produce correctly
+          // formatted tool calls — force chat completions like vLLM/NIM.
+          if (validation.api !== "openai-completions") {
+            console.log(
+              "  ℹ Using chat completions API (Ollama tool calls require /v1/chat/completions)",
+            );
+          }
+          preferredInferenceApi = "openai-completions";
+          break;
+        }
+        break;
+      } else if (selected.key === "vllm") {
+        console.log("  ✓ Using existing vLLM on localhost:8000");
+        provider = "vllm-local";
+        credentialEnv = "OPENAI_API_KEY";
+        endpointUrl = getLocalProviderBaseUrl(provider);
+        // Query vLLM for the actual model ID
+        const vllmModelsRaw = runCapture("curl -sf http://localhost:8000/v1/models 2>/dev/null", {
+          ignoreError: true,
         });
-        const modelChoice = await prompt("  Choose model [1]: ");
-        const modelIndex = parseInt(modelChoice || "1", 10) - 1;
-        model = ollamaModels[modelIndex] || ollamaModels[0] || getDefaultOllamaModel(runCapture, { endpoint: ollamaEndpoint });
+        try {
+          const vllmModels = JSON.parse(vllmModelsRaw);
+          if (vllmModels.data && vllmModels.data.length > 0) {
+            model = vllmModels.data[0].id;
+            if (!isSafeModelId(model)) {
+              console.error(`  Detected model ID contains invalid characters: ${model}`);
+              process.exit(1);
+            }
+            console.log(`  Detected model: ${model}`);
+          } else {
+            console.error("  Could not detect model from vLLM. Please specify manually.");
+            process.exit(1);
+          }
+        } catch {
+          console.error(
+            "  Could not query vLLM models endpoint. Is vLLM running on localhost:8000?",
+          );
+          process.exit(1);
+        }
+        const validation = await validateOpenAiLikeSelection(
+          "Local vLLM",
+          getLocalProviderValidationBaseUrl(provider),
+          model,
+          credentialEnv,
+        );
+        if (
+          validation.retry === "selection" ||
+          validation.retry === "back" ||
+          validation.retry === "model"
+        ) {
+          continue selectionLoop;
+        }
+        if (!validation.ok) {
+          continue selectionLoop;
+        }
+        preferredInferenceApi = validation.api;
+        // Force chat completions — vLLM's /v1/responses endpoint does not
+        // run the --tool-call-parser, so tool calls arrive as raw text.
+        // See: https://github.com/NVIDIA/NemoClaw/issues/976
+        if (preferredInferenceApi !== "openai-completions") {
+          console.log(
+            "  ℹ Using chat completions API (tool-call-parser requires /v1/chat/completions)",
+          );
+        }
+        preferredInferenceApi = "openai-completions";
+        break;
       }
-      console.log(`  Loading Ollama model: ${model}`);
-      run(`curl -sS ${getCurlTimingArgs().join(" ")} -X POST ${shellQuote(`${ollamaHostBase}/api/generate`)} -H 'Content-Type: application/json' -d '${JSON.stringify({ model, prompt: "hello", stream: false })}' > /dev/null 2>&1`, { ignoreError: true });
-      providerBaseUrl = endpointUrl;
-      break;
-    }
-
-    if (selected.key === "vllm-local") {
-      provider = "vllm-local";
-      preferredInferenceApi = "openai-responses";
-      endpointUrl = "http://localhost:8000/v1";
-      model = requestedModel || "vllm-local";
-      providerBaseUrl = endpointUrl;
-      break;
     }
   }
 
-  if (!model) model = requestedModel || DEFAULT_CLOUD_MODEL;
-
-  registry.updateSandbox(sandboxName, {
-    model,
-    provider,
-    nimContainer,
-    providerBaseUrl: providerBaseUrl || endpointUrl || null,
-  });
-
-  return { model, provider, ollamaEndpoint, providerBaseUrl: providerBaseUrl || endpointUrl || null, preferredInferenceApi, endpointUrl };
+  return { model, provider, endpointUrl, credentialEnv, preferredInferenceApi, nimContainer };
 }
 
-// ── Step 5: Inference provider ───────────────────────────────────
+// ── Step 4: Inference provider ───────────────────────────────────
 
-async function setupInference(sandboxName, model, provider, opts = {}) {
-  step(5, 7, "Setting up inference provider");
+// eslint-disable-next-line complexity
+async function setupInference(
+  sandboxName,
+  model,
+  provider,
+  endpointUrl = null,
+  credentialEnv = null,
+) {
+  step(4, 7, "Setting up inference provider");
+  runOpenshell(["gateway", "select", GATEWAY_NAME], { ignoreError: true });
 
-  let modelMetadata = opts.modelMetadata || null;
-
-  const upsertProvider = (name, type, credentialEnv, configArg) => {
-    const createArgs = [
-      "openshell",
-      "provider",
-      "create",
-      "--name",
-      name,
-      "--type",
-      type,
-    ];
-    if (credentialEnv) {
-      createArgs.push("--credential", credentialEnv);
+  if (
+    provider === "nvidia-prod" ||
+    provider === "nvidia-nim" ||
+    provider === "openai-api" ||
+    provider === "anthropic-prod" ||
+    provider === "compatible-anthropic-endpoint" ||
+    provider === "gemini-api" ||
+    provider === "compatible-endpoint"
+  ) {
+    const config =
+      provider === "nvidia-nim"
+        ? REMOTE_PROVIDER_CONFIG.build
+        : Object.values(REMOTE_PROVIDER_CONFIG).find((entry) => entry.providerName === provider);
+    while (true) {
+      const resolvedCredentialEnv = credentialEnv || (config && config.credentialEnv);
+      const resolvedEndpointUrl = endpointUrl || (config && config.endpointUrl);
+      const credentialValue = hydrateCredentialEnv(resolvedCredentialEnv);
+      const env =
+        resolvedCredentialEnv && credentialValue
+          ? { [resolvedCredentialEnv]: credentialValue }
+          : {};
+      const providerResult = upsertProvider(
+        provider,
+        config.providerType,
+        resolvedCredentialEnv,
+        resolvedEndpointUrl,
+        env,
+      );
+      if (!providerResult.ok) {
+        console.error(`  ${providerResult.message}`);
+        if (isNonInteractive()) {
+          process.exit(providerResult.status || 1);
+        }
+        const retry = await promptValidationRecovery(
+          config.label,
+          classifyApplyFailure(providerResult.message),
+          resolvedCredentialEnv,
+          config.helpUrl,
+        );
+        if (retry === "credential" || retry === "retry") {
+          continue;
+        }
+        if (retry === "selection" || retry === "model") {
+          return { retry: "selection" };
+        }
+        process.exit(providerResult.status || 1);
+      }
+      const args = ["inference", "set"];
+      if (config.skipVerify) {
+        args.push("--no-verify");
+      }
+      args.push("--provider", provider, "--model", model);
+      const applyResult = runOpenshell(args, { ignoreError: true });
+      if (applyResult.status === 0) {
+        break;
+      }
+      const message =
+        compactText(`${applyResult.stderr || ""} ${applyResult.stdout || ""}`) ||
+        `Failed to configure inference provider '${provider}'.`;
+      console.error(`  ${message}`);
+      if (isNonInteractive()) {
+        process.exit(applyResult.status || 1);
+      }
+      const retry = await promptValidationRecovery(
+        config.label,
+        classifyApplyFailure(message),
+        resolvedCredentialEnv,
+        config.helpUrl,
+      );
+      if (retry === "credential" || retry === "retry") {
+        continue;
+      }
+      if (retry === "selection" || retry === "model") {
+        return { retry: "selection" };
+      }
+      process.exit(applyResult.status || 1);
     }
-    createArgs.push("--config", configArg);
-
-    const updateArgs = ["openshell", "provider", "update", "--config", configArg];
-    if (credentialEnv) {
-      updateArgs.push("--credential", credentialEnv);
-    }
-    updateArgs.push(name);
-
-    const createCommand = createArgs.map((arg) => shellQuote(arg)).join(" ");
-    const updateCommand = updateArgs.map((arg) => shellQuote(arg)).join(" ");
-    run(`${createCommand} 2>&1 || ${updateCommand} 2>&1 || true`, { ignoreError: true });
-  };
-
-  if (provider === "nvidia-nim" || provider === "nvidia-prod") {
-    upsertProvider("nvidia-nim", "openai", "NVIDIA_API_KEY", "OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1");
-    run(
-      `openshell inference set --no-verify --provider nvidia-nim --model ${model} 2>/dev/null || true`,
-      { ignoreError: true }
-    );
   } else if (provider === "vllm-local") {
     const validation = validateLocalProvider(provider, runCapture);
     if (!validation.ok) {
@@ -2045,84 +3381,75 @@ async function setupInference(sandboxName, model, provider, opts = {}) {
       process.exit(1);
     }
     const baseUrl = getLocalProviderBaseUrl(provider);
-    upsertProvider("vllm-local", "openai", "OPENAI_API_KEY=unused", `OPENAI_BASE_URL=${baseUrl}`);
-    run(
-      `openshell inference set --no-verify --provider vllm-local --model ${model} 2>/dev/null || true`,
-      { ignoreError: true }
-    );
-  } else if (provider === "ollama-local") {
-    const validation = validateLocalProvider(provider, runCapture, {
-      endpoint: opts.ollamaEndpoint,
-      returnEndpoint: true,
+    const providerResult = upsertProvider("vllm-local", "openai", "OPENAI_API_KEY", baseUrl, {
+      OPENAI_API_KEY: "dummy",
     });
+    if (!providerResult.ok) {
+      console.error(`  ${providerResult.message}`);
+      process.exit(providerResult.status || 1);
+    }
+    runOpenshell(["inference", "set", "--no-verify", "--provider", "vllm-local", "--model", model]);
+  } else if (provider === "ollama-local") {
+    const validation = validateLocalProvider(provider, runCapture);
     if (!validation.ok) {
       console.error(`  ${validation.message}`);
       console.error("  On macOS, local inference also depends on OpenShell host routing support.");
       process.exit(1);
     }
-    const runtimeEndpoint = validation.endpoint || resolveOllamaContainerRoute(opts.ollamaEndpoint, runCapture) || opts.ollamaEndpoint;
-    const baseUrl = getLocalProviderBaseUrl(provider, { endpoint: runtimeEndpoint, runCapture });
-    upsertProvider("ollama-local", "openai", "OPENAI_API_KEY=unused", `OPENAI_BASE_URL=${baseUrl}`);
-    run(
-      `openshell inference set --no-verify --provider ollama-local --model ${model} 2>/dev/null || true`,
-      { ignoreError: true }
-    );
-    modelMetadata = getOllamaModelMetadata(runCapture, model, { endpoint: opts.ollamaEndpoint });
-    const compatibility = validateOllamaOpenClawCompatibility(model, modelMetadata);
-    if (!compatibility.ok) {
-      console.error(`  ${compatibility.message}`);
-      process.exit(1);
+    const baseUrl = getLocalProviderBaseUrl(provider);
+    const providerResult = upsertProvider("ollama-local", "openai", "OPENAI_API_KEY", baseUrl, {
+      OPENAI_API_KEY: "ollama",
+    });
+    if (!providerResult.ok) {
+      console.error(`  ${providerResult.message}`);
+      process.exit(providerResult.status || 1);
     }
+    runOpenshell([
+      "inference",
+      "set",
+      "--no-verify",
+      "--provider",
+      "ollama-local",
+      "--model",
+      model,
+    ]);
     console.log(`  Priming Ollama model: ${model}`);
-    const probe = validateOllamaModel(model, runCapture, { endpoint: opts.ollamaEndpoint });
-    const probeOutcome = getOllamaProbeOutcome(model, probe, opts);
-    if (probeOutcome.message) {
-      const log = probeOutcome.fatal ? console.error : console.warn;
-      log(`  ${probeOutcome.message}`);
-    }
-    if (probeOutcome.fatal) {
+    run(getOllamaWarmupCommand(model), { ignoreError: true });
+    const probe = validateOllamaModel(model, runCapture);
+    if (!probe.ok) {
+      console.error(`  ${probe.message}`);
       process.exit(1);
     }
   }
 
-  registry.updateSandbox(sandboxName, {
-    model,
-    provider,
-    providerBaseUrl:
-      provider === "ollama-local"
-        ? getLocalProviderBaseUrl(provider, { endpoint: opts.ollamaEndpoint, runCapture })
-        : opts.providerBaseUrl || null,
-  });
+  verifyInferenceRoute(provider, model);
+  registry.updateSandbox(sandboxName, { model, provider });
   console.log(`  ✓ Inference route set: ${provider} / ${model}`);
-
-  return { modelMetadata };
-}
-
-async function syncSandboxInferenceConfig(sandboxName, model, provider, opts = {}) {
-  const selectionConfig = getProviderSelectionConfig(provider, model);
-  if (!selectionConfig) {
-    return false;
-  }
-
-  const sandboxConfig = {
-    ...selectionConfig,
-    ...(opts.modelMetadata || {}),
-    onboardedAt: new Date().toISOString(),
-  };
-  const script = buildSandboxConfigSyncScript(sandboxConfig, {
-    controlUiAllowedOrigins: getControlUiAllowedOrigins(),
-  });
-  run(`cat <<'EOF_NEMOCLAW_SYNC' | openshell sandbox connect "${sandboxName}"
-${script}
-EOF_NEMOCLAW_SYNC`);
-  return true;
+  return { ok: true };
 }
 
 // ── Step 6: OpenClaw ─────────────────────────────────────────────
 
-async function setupOpenclaw(sandboxName, model, provider, opts = {}) {
+async function setupOpenclaw(sandboxName, model, provider) {
   step(6, 7, "Setting up OpenClaw inside sandbox");
-  await syncSandboxInferenceConfig(sandboxName, model, provider, opts);
+
+  const selectionConfig = getProviderSelectionConfig(provider, model);
+  if (selectionConfig) {
+    const sandboxConfig = {
+      ...selectionConfig,
+      onboardedAt: new Date().toISOString(),
+    };
+    const script = buildSandboxConfigSyncScript(sandboxConfig);
+    const scriptFile = writeSandboxConfigSyncFile(script);
+    try {
+      run(
+        `${openshellShellCommand(["sandbox", "connect", sandboxName])} < ${shellQuote(scriptFile)}`,
+        { stdio: ["ignore", "ignore", "inherit"] },
+      );
+    } finally {
+      cleanupTempDir(scriptFile, "nemoclaw-sync");
+    }
+  }
 
   console.log("  ✓ OpenClaw gateway launched inside sandbox");
 }
@@ -2213,13 +3540,15 @@ async function _setupPolicies(sandboxName) {
     console.log("");
     console.log("  Available policy presets:");
     allPresets.forEach((p) => {
-      const marker = applied.includes(p.name) ? "●" : "○";
+      const marker = applied.includes(p.name) || suggestions.includes(p.name) ? "●" : "○";
       const suggested = suggestions.includes(p.name) ? " (suggested)" : "";
       console.log(`    ${marker} ${p.name} — ${p.description}${suggested}`);
     });
     console.log("");
 
-    const answer = await prompt(`  Apply suggested presets (${suggestions.join(", ")})? [Y/n/list]: `);
+    const answer = await prompt(
+      `  Apply suggested presets (${suggestions.join(", ")})? [Y/n/list]: `,
+    );
 
     if (answer.toLowerCase() === "n") {
       console.log("  Skipping policy presets.");
@@ -2234,7 +3563,10 @@ async function _setupPolicies(sandboxName) {
     if (answer.toLowerCase() === "list") {
       // Let user pick
       const picks = await prompt("  Enter preset names (comma-separated): ");
-      const selected = picks.split(",").map((s) => s.trim()).filter(Boolean);
+      const selected = picks
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
       for (const name of selected) {
         try {
           policies.applyPreset(sandboxName, name);
@@ -2267,7 +3599,7 @@ async function _setupPolicies(sandboxName) {
   console.log("  ✓ Policies applied");
 }
 
-function _arePolicyPresetsApplied(sandboxName, selectedPresets = []) {
+function arePolicyPresetsApplied(sandboxName, selectedPresets = []) {
   if (!Array.isArray(selectedPresets) || selectedPresets.length === 0) return false;
   const applied = new Set(policies.getAppliedPresets(sandboxName));
   return selectedPresets.every((preset) => applied.has(preset));
@@ -2277,13 +3609,16 @@ function _arePolicyPresetsApplied(sandboxName, selectedPresets = []) {
 async function setupPoliciesWithSelection(sandboxName, options = {}) {
   const selectedPresets = Array.isArray(options.selectedPresets) ? options.selectedPresets : null;
   const onSelection = typeof options.onSelection === "function" ? options.onSelection : null;
+  const webSearchConfig = options.webSearchConfig || null;
 
   step(7, 7, "Policy presets");
 
   const suggestions = ["pypi", "npm"];
   if (getCredential("TELEGRAM_BOT_TOKEN")) suggestions.push("telegram");
   if (getCredential("SLACK_BOT_TOKEN") || process.env.SLACK_BOT_TOKEN) suggestions.push("slack");
-  if (getCredential("DISCORD_BOT_TOKEN") || process.env.DISCORD_BOT_TOKEN) suggestions.push("discord");
+  if (getCredential("DISCORD_BOT_TOKEN") || process.env.DISCORD_BOT_TOKEN)
+    suggestions.push("discord");
+  if (webSearchConfig) suggestions.push("brave");
 
   const allPresets = policies.listPresets();
   const applied = policies.getAppliedPresets(sandboxName);
@@ -2373,7 +3708,9 @@ async function setupPoliciesWithSelection(sandboxName, options = {}) {
   });
   console.log("");
 
-  const answer = await prompt(`  Apply suggested presets (${suggestions.join(", ")})? [Y/n/list]: `);
+  const answer = await prompt(
+    `  Apply suggested presets (${suggestions.join(", ")})? [Y/n/list]: `,
+  );
 
   if (answer.toLowerCase() === "n") {
     console.log("  Skipping policy presets.");
@@ -2387,10 +3724,20 @@ async function setupPoliciesWithSelection(sandboxName, options = {}) {
   }
 
   const knownPresets = new Set(allPresets.map((p) => p.name));
-  const invalidPresets = interactiveChoice.filter((name) => !knownPresets.has(name));
-  if (invalidPresets.length > 0) {
+  let invalidPresets = interactiveChoice.filter((name) => !knownPresets.has(name));
+  while (invalidPresets.length > 0) {
     console.error(`  Unknown policy preset(s): ${invalidPresets.join(", ")}`);
-    process.exit(1);
+    console.log("  Available presets:");
+    for (const p of allPresets) {
+      console.log(`    - ${p.name}`);
+    }
+    const retry = await prompt("  Enter preset names (comma-separated), or leave empty to skip: ");
+    if (!retry.trim()) {
+      console.log("  Skipping policy presets.");
+      return [];
+    }
+    interactiveChoice = parsePolicyPresetEnv(retry);
+    invalidPresets = interactiveChoice.filter((name) => !knownPresets.has(name));
   }
 
   if (onSelection) onSelection(interactiveChoice);
@@ -2407,106 +3754,691 @@ async function setupPoliciesWithSelection(sandboxName, options = {}) {
 
 // ── Dashboard ────────────────────────────────────────────────────
 
-function printDashboard(sandboxName, model, provider) {
-  // Refresh the dashboard forward before printing URLs so links are live.
-  runOpenshell(["forward", "stop", "18789", sandboxName], { ignoreError: true });
-  run(getDashboardForwardStartCommand(sandboxName), { ignoreError: true });
+const CONTROL_UI_PORT = 18789;
 
-  const sandbox = registry.getSandbox(sandboxName) || { name: sandboxName, provider };
-  const runtimeLines = getInferenceRuntimeStatus(
-    sandbox,
-    (name) => {
-      const status = nim.nimStatus(name) || {};
-      return {
-        running: Boolean(status['running']),
-        healthy: typeof status['healthy'] === "boolean" ? status['healthy'] : false,
-      };
+// Dashboard helpers — delegated to src/lib/dashboard.ts
+// isLoopbackHostname — see urlUtils import above
+const { resolveDashboardForwardTarget, buildControlUiUrls } = dashboard;
+
+function ensureDashboardForward(sandboxName, chatUiUrl = `http://127.0.0.1:${CONTROL_UI_PORT}`) {
+  const forwardTarget = resolveDashboardForwardTarget(chatUiUrl);
+  runOpenshell(["forward", "stop", String(CONTROL_UI_PORT)], { ignoreError: true });
+  // Use stdio "ignore" to prevent spawnSync from waiting on inherited pipe fds.
+  // The --background flag forks a child that inherits stdout/stderr; if those are
+  // pipes, spawnSync blocks until the background process exits (never).
+  runOpenshell(["forward", "start", "--background", forwardTarget, sandboxName], {
+    ignoreError: true,
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+}
+
+function findOpenclawJsonPath(dir) {
+  if (!fs.existsSync(dir)) return null;
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      const found = findOpenclawJsonPath(p);
+      if (found) return found;
+    } else if (e.name === "openclaw.json") {
+      return p;
     }
-  ) || [];
-  const dashboardAccess = getDashboardAccessInfo(sandboxName);
-  const dashboardGuidance = getDashboardGuidanceLines(dashboardAccess);
+  }
+  return null;
+}
+
+/**
+ * Pull gateway.auth.token from the sandbox image via openshell sandbox download
+ * so onboard can print copy-paste Control UI URLs with #token= (same idea as nemoclaw-start.sh).
+ */
+function fetchGatewayAuthTokenFromSandbox(sandboxName) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-token-"));
+  try {
+    const destDir = `${tmpDir}${path.sep}`;
+    const result = runOpenshell(
+      ["sandbox", "download", sandboxName, "/sandbox/.openclaw/openclaw.json", destDir],
+      { ignoreError: true, stdio: ["ignore", "ignore", "ignore"] },
+    );
+    if (result.status !== 0) return null;
+    const jsonPath = findOpenclawJsonPath(tmpDir);
+    if (!jsonPath) return null;
+    const cfg = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
+    const token = cfg && cfg.gateway && cfg.gateway.auth && cfg.gateway.auth.token;
+    return typeof token === "string" && token.length > 0 ? token : null;
+  } catch {
+    return null;
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+}
+
+// buildControlUiUrls — see dashboard import above
+
+function printDashboard(sandboxName, model, provider, nimContainer = null) {
+  const nimStat = nimContainer ? nim.nimStatusByName(nimContainer) : nim.nimStatus(sandboxName);
+  const nimLabel = nimStat.running ? "running" : "not running";
 
   let providerLabel = provider;
   if (provider === "nvidia-prod" || provider === "nvidia-nim") providerLabel = "NVIDIA Endpoints";
   else if (provider === "openai-api") providerLabel = "OpenAI";
   else if (provider === "anthropic-prod") providerLabel = "Anthropic";
-  else if (provider === "compatible-anthropic-endpoint") providerLabel = "Other Anthropic-compatible endpoint";
+  else if (provider === "compatible-anthropic-endpoint")
+    providerLabel = "Other Anthropic-compatible endpoint";
   else if (provider === "gemini-api") providerLabel = "Google Gemini";
   else if (provider === "compatible-endpoint") providerLabel = "Other OpenAI-compatible endpoint";
   else if (provider === "vllm-local") providerLabel = "Local vLLM";
   else if (provider === "ollama-local") providerLabel = "Local Ollama";
 
+  const token = fetchGatewayAuthTokenFromSandbox(sandboxName);
+
   console.log("");
   console.log(`  ${"─".repeat(50)}`);
-  for (const access of dashboardAccess) {
-    console.log(`  ${access.label.padEnd(12)}${access.url}`);
-  }
-  for (const guidance of dashboardGuidance) {
-    console.log(`  ${guidance}`);
-  }
+  // console.log(`  Dashboard    http://localhost:18789/`);
   console.log(`  Sandbox      ${sandboxName} (Landlock + seccomp + netns)`);
   console.log(`  Model        ${model} (${providerLabel})`);
-  for (const line of runtimeLines) {
-    if (line && typeof line.label === "string" && typeof line.value !== "undefined") {
-      console.log(`  ${line.label.padEnd(12)}${line.value}`);
-    }
-  }
+  console.log(`  NIM          ${nimLabel}`);
   console.log(`  ${"─".repeat(50)}`);
   console.log(`  Run:         nemoclaw ${sandboxName} connect`);
   console.log(`  Status:      nemoclaw ${sandboxName} status`);
   console.log(`  Logs:        nemoclaw ${sandboxName} logs --follow`);
+  console.log("");
+  if (token) {
+    console.log("  OpenClaw UI (tokenized URL; treat it like a password)");
+    console.log(`  Port ${CONTROL_UI_PORT} must be forwarded before opening this URL.`);
+    for (const url of buildControlUiUrls(token)) {
+      console.log(`  ${url}`);
+    }
+  } else {
+    note("  Could not read gateway token from the sandbox (download failed).");
+    console.log("  OpenClaw UI");
+    console.log(`  Port ${CONTROL_UI_PORT} must be forwarded before opening this URL.`);
+    for (const url of buildControlUiUrls()) {
+      console.log(`  ${url}`);
+    }
+    console.log(
+      `  Token:       nemoclaw ${sandboxName} connect  →  jq -r '.gateway.auth.token' /sandbox/.openclaw/openclaw.json`,
+    );
+    console.log(
+      `               append  #token=<token>  to the URL, or see /tmp/gateway.log inside the sandbox.`,
+    );
+  }
   console.log(`  ${"─".repeat(50)}`);
   console.log("");
 }
 
+function getDashboardForwardPort() {
+  return CONTROL_UI_PORT;
+}
+
+function getDashboardForwardStartCommand(sandboxName, options = {}) {
+  const forwardTarget = isWsl(options)
+    ? `0.0.0.0:${CONTROL_UI_PORT}`
+    : resolveDashboardForwardTarget(`http://127.0.0.1:${CONTROL_UI_PORT}`);
+  return `${openshellShellCommand(["forward", "start", "--background", forwardTarget, sandboxName])}`;
+}
+
+function buildAuthenticatedDashboardUrl(baseUrl, token = null) {
+  if (!token) return baseUrl;
+  return `${baseUrl}#token=${encodeURIComponent(token)}`;
+}
+
+function getWslHostAddress(options = {}) {
+  if (options.wslHostAddress) {
+    return options.wslHostAddress;
+  }
+  if (!isWsl(options)) {
+    return null;
+  }
+  const runCaptureFn = options.runCapture || runCapture;
+  const output = runCaptureFn("hostname -I 2>/dev/null", { ignoreError: true });
+  const candidates = String(output || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  return candidates[0] || null;
+}
+
+function getDashboardAccessInfo(sandboxName, options = {}) {
+  const token = Object.prototype.hasOwnProperty.call(options, "token")
+    ? options.token
+    : fetchGatewayAuthTokenFromSandbox(sandboxName);
+  const dashboardAccess = buildControlUiUrls(token).map((url, index) => ({
+    label: index === 0 ? "Dashboard" : `Alt ${index}`,
+    url: buildAuthenticatedDashboardUrl(url, null),
+  }));
+
+  const wslHostAddress = getWslHostAddress(options);
+  if (wslHostAddress) {
+    const wslUrl = buildAuthenticatedDashboardUrl(
+      `http://${wslHostAddress}:${CONTROL_UI_PORT}/`,
+      token,
+    );
+    if (!dashboardAccess.some((access) => access.url === wslUrl)) {
+      dashboardAccess.push({ label: "VS Code/WSL", url: wslUrl });
+    }
+  }
+
+  return dashboardAccess;
+}
+
+function getDashboardGuidanceLines(dashboardAccess = []) {
+  const guidance = [`Port ${CONTROL_UI_PORT} must be forwarded before opening these URLs.`];
+  if (isWsl()) {
+    guidance.push(
+      "WSL detected: if localhost fails in Windows, use the WSL host IP shown by `hostname -I`.",
+    );
+  }
+  if (dashboardAccess.length === 0) {
+    guidance.push("No dashboard URLs were generated.");
+  }
+  return guidance;
+}
+
+function buildControlUiConfigSyncScript() {
+  return [
+    "mkdir -p ~/.openclaw",
+    "if [ -f ~/.openclaw/openclaw.json ]; then",
+    "  chmod 600 ~/.openclaw/openclaw.json || true",
+    "fi",
+    "exit",
+  ].join("\n");
+}
+
+function getControlUiAllowedOrigins() {
+  return buildControlUiUrls().map((url) => {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return url;
+    }
+  });
+}
+
+async function syncSandboxInferenceConfig(sandboxName, model, provider, options = {}) {
+  const selectionConfig = getProviderSelectionConfig(provider, model);
+  if (!selectionConfig) {
+    return false;
+  }
+  const sandboxConfig = {
+    ...selectionConfig,
+    endpointUrl: options.providerBaseUrl || selectionConfig.endpointUrl || null,
+    onboardedAt: new Date().toISOString(),
+  };
+  const script = buildSandboxConfigSyncScript(sandboxConfig);
+  const scriptFile = writeSandboxConfigSyncFile(script);
+  try {
+    run(
+      `${openshellShellCommand(["sandbox", "connect", sandboxName])} < ${shellQuote(scriptFile)}`,
+      {
+        stdio: ["ignore", "ignore", "inherit"],
+      },
+    );
+    return true;
+  } finally {
+    cleanupTempDir(scriptFile, "nemoclaw-sync");
+  }
+}
+
+function syncSandboxControlUiConfig(sandboxName) {
+  const script = buildControlUiConfigSyncScript();
+  const scriptFile = writeSandboxConfigSyncFile(script);
+  try {
+    run(
+      `${openshellShellCommand(["sandbox", "connect", sandboxName])} < ${shellQuote(scriptFile)}`,
+      {
+        stdio: ["ignore", "ignore", "inherit"],
+        ignoreError: true,
+      },
+    );
+    ensureDashboardForward(sandboxName);
+    return true;
+  } finally {
+    cleanupTempDir(scriptFile, "nemoclaw-sync");
+  }
+}
+
+function isWslEnvironment() {
+  return isWsl();
+}
+
+function getOllamaProbeOutcome(model) {
+  return validateOllamaModel(model, runCapture);
+}
+
+function startRecordedStep(stepName, updates = {}) {
+  onboardSession.markStepStarted(stepName);
+  if (Object.keys(updates).length > 0) {
+    onboardSession.updateSession((session) => {
+      if (typeof updates.sandboxName === "string") session.sandboxName = updates.sandboxName;
+      if (typeof updates.provider === "string") session.provider = updates.provider;
+      if (typeof updates.model === "string") session.model = updates.model;
+      return session;
+    });
+  }
+}
+
+const ONBOARD_STEP_INDEX = {
+  preflight: { number: 1, title: "Preflight checks" },
+  gateway: { number: 2, title: "Starting OpenShell gateway" },
+  provider_selection: { number: 3, title: "Configuring inference (NIM)" },
+  inference: { number: 4, title: "Setting up inference provider" },
+  sandbox: { number: 5, title: "Creating sandbox" },
+  openclaw: { number: 6, title: "Setting up OpenClaw inside sandbox" },
+  policies: { number: 7, title: "Policy presets" },
+};
+
+function skippedStepMessage(stepName, detail, reason = "resume") {
+  const stepInfo = ONBOARD_STEP_INDEX[stepName];
+  if (stepInfo) {
+    step(stepInfo.number, 7, stepInfo.title);
+  }
+  const prefix = reason === "reuse" ? "[reuse]" : "[resume]";
+  console.log(`  ${prefix} Skipping ${stepName}${detail ? ` (${detail})` : ""}`);
+}
+
 // ── Main ─────────────────────────────────────────────────────────
 
+// eslint-disable-next-line complexity
 async function onboard(opts = {}) {
   NON_INTERACTIVE = opts.nonInteractive || process.env.NEMOCLAW_NON_INTERACTIVE === "1";
+  delete process.env.OPENSHELL_GATEWAY;
+  const resume = opts.resume === true;
+  const noticeAccepted = await ensureUsageNoticeConsent({
+    nonInteractive: isNonInteractive(),
+    acceptedByFlag: opts.acceptThirdPartySoftware === true,
+    writeLine: console.error,
+  });
+  if (!noticeAccepted) {
+    process.exit(1);
+  }
+  const lockResult = onboardSession.acquireOnboardLock(
+    `nemoclaw onboard${resume ? " --resume" : ""}${isNonInteractive() ? " --non-interactive" : ""}`,
+  );
+  if (!lockResult.acquired) {
+    console.error("  Another NemoClaw onboarding run is already in progress.");
+    if (lockResult.holderPid) {
+      console.error(`  Lock holder PID: ${lockResult.holderPid}`);
+    }
+    if (lockResult.holderStartedAt) {
+      console.error(`  Started: ${lockResult.holderStartedAt}`);
+    }
+    console.error("  Wait for it to finish, or remove the stale lock if the previous run crashed:");
+    console.error(`    rm -f "${lockResult.lockFile}"`);
+    process.exit(1);
+  }
 
-  console.log("");
-  console.log("  NemoClaw Onboarding");
-  if (isNonInteractive()) console.log("  (non-interactive mode)");
-  console.log("  ===================");
+  let lockReleased = false;
+  const releaseOnboardLock = () => {
+    if (lockReleased) return;
+    lockReleased = true;
+    onboardSession.releaseOnboardLock();
+  };
+  process.once("exit", releaseOnboardLock);
 
-  const { gpu, reusingGateway } = await preflight();
-  await startGateway(gpu, reusingGateway);
-  const sandboxName = await createSandbox(gpu);
-  const { model, provider, ollamaEndpoint, providerBaseUrl } = await setupNim(sandboxName, gpu);
-  const { modelMetadata } = await setupInference(sandboxName, model, provider, { ollamaEndpoint, providerBaseUrl });
-  delete process.env.NVIDIA_API_KEY;
-  await setupOpenclaw(sandboxName, model, provider, { modelMetadata });
-  await setupPoliciesWithSelection(sandboxName);
-  printDashboard(sandboxName, model, provider);
+  try {
+    let session;
+    if (resume) {
+      session = onboardSession.loadSession();
+      if (!session || session.resumable === false) {
+        console.error("  No resumable onboarding session was found.");
+        console.error("  Run: nemoclaw onboard");
+        process.exit(1);
+      }
+      const resumeConflicts = getResumeConfigConflicts(session, {
+        nonInteractive: isNonInteractive(),
+      });
+      if (resumeConflicts.length > 0) {
+        for (const conflict of resumeConflicts) {
+          if (conflict.field === "sandbox") {
+            console.error(
+              `  Resumable state belongs to sandbox '${conflict.recorded}', not '${conflict.requested}'.`,
+            );
+          } else {
+            console.error(
+              `  Resumable state recorded ${conflict.field} '${conflict.recorded}', not '${conflict.requested}'.`,
+            );
+          }
+        }
+        console.error("  Run: nemoclaw onboard              # start a fresh onboarding session");
+        console.error("  Or rerun with the original settings to continue that session.");
+        process.exit(1);
+      }
+      onboardSession.updateSession((current) => {
+        current.mode = isNonInteractive() ? "non-interactive" : "interactive";
+        current.failure = null;
+        current.status = "in_progress";
+        return current;
+      });
+      session = onboardSession.loadSession();
+    } else {
+      session = onboardSession.saveSession(
+        onboardSession.createSession({
+          mode: isNonInteractive() ? "non-interactive" : "interactive",
+          metadata: { gatewayName: "nemoclaw" },
+        }),
+      );
+    }
+
+    let completed = false;
+    process.once("exit", (code) => {
+      if (!completed && code !== 0) {
+        const current = onboardSession.loadSession();
+        const failedStep = current?.lastStepStarted;
+        if (failedStep) {
+          onboardSession.markStepFailed(failedStep, "Onboarding exited before the step completed.");
+        }
+      }
+    });
+
+    console.log("");
+    console.log("  NemoClaw Onboarding");
+    if (isNonInteractive()) note("  (non-interactive mode)");
+    if (resume) note("  (resume mode)");
+    console.log("  ===================");
+
+    let gpu;
+    const resumePreflight = resume && session?.steps?.preflight?.status === "complete";
+    if (resumePreflight) {
+      skippedStepMessage("preflight", "cached");
+      gpu = nim.detectGpu();
+    } else {
+      startRecordedStep("preflight");
+      gpu = await preflight();
+      onboardSession.markStepComplete("preflight");
+    }
+
+    const gatewayStatus = runCaptureOpenshell(["status"], { ignoreError: true });
+    const gatewayInfo = runCaptureOpenshell(["gateway", "info", "-g", GATEWAY_NAME], {
+      ignoreError: true,
+    });
+    const activeGatewayInfo = runCaptureOpenshell(["gateway", "info"], { ignoreError: true });
+    const gatewayReuseState = getGatewayReuseState(gatewayStatus, gatewayInfo, activeGatewayInfo);
+    const canReuseHealthyGateway = gatewayReuseState === "healthy";
+    const resumeGateway =
+      resume && session?.steps?.gateway?.status === "complete" && canReuseHealthyGateway;
+    if (resumeGateway) {
+      skippedStepMessage("gateway", "running");
+    } else if (!resume && canReuseHealthyGateway) {
+      skippedStepMessage("gateway", "running", "reuse");
+      note("  Reusing healthy NemoClaw gateway.");
+    } else {
+      if (resume && session?.steps?.gateway?.status === "complete") {
+        if (gatewayReuseState === "active-unnamed") {
+          note("  [resume] Gateway is active but named metadata is missing; recreating it safely.");
+        } else if (gatewayReuseState === "foreign-active") {
+          note("  [resume] A different OpenShell gateway is active; NemoClaw will not reuse it.");
+        } else if (gatewayReuseState === "stale") {
+          note("  [resume] Recorded gateway is unhealthy; recreating it.");
+        } else {
+          note("  [resume] Recorded gateway state is unavailable; recreating it.");
+        }
+      }
+      startRecordedStep("gateway");
+      await startGateway(gpu);
+      onboardSession.markStepComplete("gateway");
+    }
+
+    let sandboxName = session?.sandboxName || null;
+    let model = session?.model || null;
+    let provider = session?.provider || null;
+    let endpointUrl = session?.endpointUrl || null;
+    let credentialEnv = session?.credentialEnv || null;
+    let preferredInferenceApi = session?.preferredInferenceApi || null;
+    let nimContainer = session?.nimContainer || null;
+    let webSearchConfig = session?.webSearchConfig || null;
+    let forceProviderSelection = false;
+    while (true) {
+      const resumeProviderSelection =
+        !forceProviderSelection &&
+        resume &&
+        session?.steps?.provider_selection?.status === "complete" &&
+        typeof provider === "string" &&
+        typeof model === "string";
+      if (resumeProviderSelection) {
+        skippedStepMessage("provider_selection", `${provider} / ${model}`);
+        hydrateCredentialEnv(credentialEnv);
+      } else {
+        startRecordedStep("provider_selection", { sandboxName });
+        const selection = await setupNim(gpu);
+        model = selection.model;
+        provider = selection.provider;
+        endpointUrl = selection.endpointUrl;
+        credentialEnv = selection.credentialEnv;
+        preferredInferenceApi = selection.preferredInferenceApi;
+        nimContainer = selection.nimContainer;
+        onboardSession.markStepComplete("provider_selection", {
+          sandboxName,
+          provider,
+          model,
+          endpointUrl,
+          credentialEnv,
+          preferredInferenceApi,
+          nimContainer,
+        });
+      }
+
+      process.env.NEMOCLAW_OPENSHELL_BIN = getOpenshellBinary();
+      const resumeInference =
+        !forceProviderSelection &&
+        resume &&
+        typeof provider === "string" &&
+        typeof model === "string" &&
+        isInferenceRouteReady(provider, model);
+      if (resumeInference) {
+        skippedStepMessage("inference", `${provider} / ${model}`);
+        if (nimContainer) {
+          registry.updateSandbox(sandboxName, { nimContainer });
+        }
+        onboardSession.markStepComplete("inference", {
+          sandboxName,
+          provider,
+          model,
+          nimContainer,
+        });
+        break;
+      }
+
+      startRecordedStep("inference", { sandboxName, provider, model });
+      const inferenceResult = await setupInference(
+        GATEWAY_NAME,
+        model,
+        provider,
+        endpointUrl,
+        credentialEnv,
+      );
+      delete process.env.NVIDIA_API_KEY;
+      if (inferenceResult?.retry === "selection") {
+        forceProviderSelection = true;
+        continue;
+      }
+      if (nimContainer) {
+        registry.updateSandbox(sandboxName, { nimContainer });
+      }
+      onboardSession.markStepComplete("inference", { sandboxName, provider, model, nimContainer });
+      break;
+    }
+
+    if (webSearchConfig) {
+      note("  [resume] Revalidating Brave Search configuration.");
+      const braveApiKey = await ensureValidatedBraveSearchCredential();
+      if (braveApiKey) {
+        webSearchConfig = { fetchEnabled: true };
+        onboardSession.updateSession((current) => {
+          current.webSearchConfig = webSearchConfig;
+          return current;
+        });
+        note("  [resume] Reusing Brave Search configuration.");
+      } else {
+        webSearchConfig = await configureWebSearch(null);
+        onboardSession.updateSession((current) => {
+          current.webSearchConfig = webSearchConfig;
+          return current;
+        });
+      }
+    } else {
+      webSearchConfig = await configureWebSearch(webSearchConfig);
+      onboardSession.updateSession((current) => {
+        current.webSearchConfig = webSearchConfig;
+        return current;
+      });
+    }
+
+    const sandboxReuseState = getSandboxReuseState(sandboxName);
+    const resumeSandbox =
+      resume && session?.steps?.sandbox?.status === "complete" && sandboxReuseState === "ready";
+    if (resumeSandbox) {
+      skippedStepMessage("sandbox", sandboxName);
+    } else {
+      if (resume && session?.steps?.sandbox?.status === "complete") {
+        if (sandboxReuseState === "not_ready") {
+          note(
+            `  [resume] Recorded sandbox '${sandboxName}' exists but is not ready; recreating it.`,
+          );
+          repairRecordedSandbox(sandboxName);
+        } else {
+          note("  [resume] Recorded sandbox state is unavailable; recreating it.");
+          if (sandboxName) {
+            registry.removeSandbox(sandboxName);
+          }
+        }
+      }
+      startRecordedStep("sandbox", { sandboxName, provider, model });
+      sandboxName = await createSandbox(
+        gpu,
+        model,
+        provider,
+        preferredInferenceApi,
+        sandboxName,
+        webSearchConfig,
+      );
+      onboardSession.markStepComplete("sandbox", { sandboxName, provider, model, nimContainer });
+    }
+
+    const resumeOpenclaw = resume && sandboxName && isOpenclawReady(sandboxName);
+    if (resumeOpenclaw) {
+      skippedStepMessage("openclaw", sandboxName);
+      onboardSession.markStepComplete("openclaw", { sandboxName, provider, model });
+    } else {
+      startRecordedStep("openclaw", { sandboxName, provider, model });
+      await setupOpenclaw(sandboxName, model, provider);
+      onboardSession.markStepComplete("openclaw", { sandboxName, provider, model });
+    }
+
+    const recordedPolicyPresets = Array.isArray(session?.policyPresets)
+      ? session.policyPresets
+      : null;
+    const resumePolicies =
+      resume && sandboxName && arePolicyPresetsApplied(sandboxName, recordedPolicyPresets || []);
+    if (resumePolicies) {
+      skippedStepMessage("policies", (recordedPolicyPresets || []).join(", "));
+      onboardSession.markStepComplete("policies", {
+        sandboxName,
+        provider,
+        model,
+        policyPresets: recordedPolicyPresets || [],
+      });
+    } else {
+      startRecordedStep("policies", {
+        sandboxName,
+        provider,
+        model,
+        policyPresets: recordedPolicyPresets || [],
+      });
+      const appliedPolicyPresets = await setupPoliciesWithSelection(sandboxName, {
+        selectedPresets:
+          resume &&
+          session?.steps?.policies?.status !== "complete" &&
+          Array.isArray(recordedPolicyPresets) &&
+          recordedPolicyPresets.length > 0
+            ? recordedPolicyPresets
+            : null,
+        webSearchConfig,
+        onSelection: (policyPresets) => {
+          onboardSession.updateSession((current) => {
+            current.policyPresets = policyPresets;
+            return current;
+          });
+        },
+      });
+      onboardSession.markStepComplete("policies", {
+        sandboxName,
+        provider,
+        model,
+        policyPresets: appliedPolicyPresets,
+      });
+    }
+
+    onboardSession.completeSession({ sandboxName, provider, model });
+    completed = true;
+    printDashboard(sandboxName, model, provider, nimContainer);
+  } finally {
+    releaseOnboardLock();
+  }
 }
 
 module.exports = {
   buildAuthenticatedDashboardUrl,
   buildControlUiConfigSyncScript,
   buildSandboxConfigSyncScript,
+  copyBuildContextDir,
   classifySandboxCreateFailure,
-  countListedSandboxes,
   createSandbox,
   getControlUiAllowedOrigins,
+  getDashboardAccessInfo,
   getDashboardForwardPort,
   getDashboardForwardStartCommand,
-  getDashboardAccessInfo,
   getDashboardGuidanceLines,
+  getFutureShellPathHint,
   getGatewayClusterContainerName,
-  getGatewayReuseState,
   getReportedGatewayEndpoint,
   getReportedGatewayName,
-  getSandboxState,
-  hasLocalGatewayContainer,
+  getGatewayStartEnv,
+  getGatewayReuseState,
+  getOllamaProbeOutcome,
+  getSandboxInferenceConfig,
+  getInstalledOpenshellVersion,
+  getRequestedModelHint,
+  getRequestedProviderHint,
+  getStableGatewayImageRef,
+  getResumeConfigConflicts,
+  countListedSandboxes,
+  isGatewayHealthy,
   hasStaleGateway,
+  hasLocalGatewayContainer,
+  getRequestedSandboxNameHint,
+  getResumeSandboxConflict,
+  getSandboxReuseState,
+  getSandboxStateFromOutputs,
+  getPortConflictServiceHints,
+  classifyValidationFailure,
   isSandboxReady,
+  isLoopbackHostname,
   isWslEnvironment,
   listLocalGatewayNames,
+  normalizeProviderBaseUrl,
   onboard,
-  promptForExistingGatewayAction,
-  getOllamaProbeOutcome,
+  onboardSession,
+  printSandboxCreateRecoveryHints,
+  pruneStaleSandboxEntry,
+  repairRecordedSandbox,
+  recoverGatewayRuntime,
+  resolveDashboardForwardTarget,
+  startGatewayForRecovery,
+  runCaptureOpenshell,
   setupInference,
   setupNim,
-  syncSandboxInferenceConfig,
+  isInferenceRouteReady,
+  isOpenclawReady,
+  arePolicyPresetsApplied,
   syncSandboxControlUiConfig,
+  syncSandboxInferenceConfig,
+  setupPoliciesWithSelection,
+  hydrateCredentialEnv,
+  shouldIncludeBuildContextPath,
+  writeSandboxConfigSyncFile,
+  patchStagedDockerfile,
 };

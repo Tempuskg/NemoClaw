@@ -30,17 +30,18 @@ describe("sandbox readiness parsing", () => {
   });
 
   it("strips ANSI escape codes before matching", () => {
-    expect(isSandboxReady(
-      "\x1b[1mmy-assistant\x1b[0m   \x1b[32mReady\x1b[0m   2m ago",
-      "my-assistant"
-    )).toBeTruthy();
+    expect(
+      isSandboxReady("\x1b[1mmy-assistant\x1b[0m   \x1b[32mReady\x1b[0m   2m ago", "my-assistant"),
+    ).toBeTruthy();
   });
 
   it("rejects ANSI-wrapped NotReady", () => {
-    expect(!isSandboxReady(
-      "\x1b[1mmy-assistant\x1b[0m   \x1b[31mNotReady\x1b[0m   crash",
-      "my-assistant"
-    )).toBeTruthy();
+    expect(
+      !isSandboxReady(
+        "\x1b[1mmy-assistant\x1b[0m   \x1b[31mNotReady\x1b[0m   crash",
+        "my-assistant",
+      ),
+    ).toBeTruthy();
   });
 
   it("exact-matches sandbox name in first column", () => {
@@ -50,7 +51,7 @@ describe("sandbox readiness parsing", () => {
 
   it("does not match sandbox name in non-first column", () => {
     expect(
-      !isSandboxReady("other-box   Ready   owned-by-my-assistant", "my-assistant")
+      !isSandboxReady("other-box   Ready   owned-by-my-assistant", "my-assistant"),
     ).toBeTruthy();
   });
 
@@ -69,13 +70,13 @@ describe("sandbox readiness parsing", () => {
 
   it("handles Ready sandbox with extra status columns", () => {
     expect(
-      isSandboxReady("my-assistant   Ready   Running   2m ago   1/1", "my-assistant")
+      isSandboxReady("my-assistant   Ready   Running   2m ago   1/1", "my-assistant"),
     ).toBeTruthy();
   });
 
   it("rejects when output only contains name in a URL or path", () => {
     expect(
-      !isSandboxReady("Connecting to my-assistant.openshell.internal Ready", "my-assistant")
+      !isSandboxReady("Connecting to my-assistant.openshell.internal Ready", "my-assistant"),
     ).toBeTruthy();
     // "my-assistant.openshell.internal" is cols[0], not "my-assistant"
   });
@@ -91,7 +92,7 @@ describe("WSL sandbox name handling", () => {
   it("buildPolicySetCommand preserves hyphenated sandbox name", () => {
     const cmd = buildPolicySetCommand("/tmp/policy.yaml", "my-assistant");
     expect(cmd.includes("'my-assistant'")).toBeTruthy();
-    expect(!cmd.includes(' my-assistant ')).toBeTruthy();
+    expect(!cmd.includes(" my-assistant ")).toBeTruthy();
   });
 
   it("buildPolicyGetCommand preserves hyphenated sandbox name", () => {

@@ -10,8 +10,11 @@
 # The config hash is verified at startup to detect tampering.
 #
 # Optional env:
-#   NVIDIA_API_KEY   API key for NVIDIA-hosted inference
-#   CHAT_UI_URL      Browser origin that will access the forwarded dashboard
+#   NVIDIA_API_KEY                API key for NVIDIA-hosted inference
+#   CHAT_UI_URL                   Browser origin that will access the forwarded dashboard
+#   NEMOCLAW_DISABLE_DEVICE_AUTH  Build-time only. Set to "1" to skip device-pairing auth
+#                                 (development/headless). Has no runtime effect — openclaw.json
+#                                 is baked at image build and verified by hash at startup.
 
 set -euo pipefail
 
@@ -54,10 +57,38 @@ elif [ "${NEMOCLAW_CAPS_DROPPED:-}" != "1" ]; then
   echo "[SECURITY WARNING] capsh not available — running with default capabilities" >&2
 fi
 
-# Filter out self-invocation: openshell sandbox create passes "nemoclaw-start"
-# as the command, but since this script is now the ENTRYPOINT, receiving our
-# own name as $1 would cause infinite recursion via the NEMOCLAW_CMD exec path.
-# Only strip from $1 — later args with this name are legitimate user arguments.
+# Normalize the sandbox-create bootstrap wrapper. Onboard launches the
+# container as `env CHAT_UI_URL=... nemoclaw-start`, but this script is already
+# the ENTRYPOINT. If we treat that wrapper as a real command, the root path will
+# try `gosu sandbox env ... nemoclaw-start`, which fails on Spark/arm64 when
+# no-new-privileges blocks gosu. Consume only the self-wrapper form and promote
+# the env assignments into the current process.
+if [ "${1:-}" = "env" ]; then
+  _raw_args=("$@")
+  _self_wrapper_index=""
+  for ((i = 1; i < ${#_raw_args[@]}; i += 1)); do
+    case "${_raw_args[$i]}" in
+      *=*) ;;
+      nemoclaw-start | /usr/local/bin/nemoclaw-start)
+        _self_wrapper_index="$i"
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  if [ -n "$_self_wrapper_index" ]; then
+    for ((i = 1; i < _self_wrapper_index; i += 1)); do
+      export "${_raw_args[$i]}"
+    done
+    set -- "${_raw_args[@]:$((_self_wrapper_index + 1))}"
+  fi
+fi
+
+# Filter out direct self-invocation too. Since this script is the ENTRYPOINT,
+# receiving our own name as $1 would otherwise recurse via the NEMOCLAW_CMD
+# exec path. Only strip from $1 — later args with this name are legitimate.
 case "${1:-}" in
   nemoclaw-start | /usr/local/bin/nemoclaw-start) shift ;;
 esac
@@ -77,13 +108,13 @@ export PERSISTENT_AGENTS_PATH="/sandbox/.nemoclaw/agents-overlay.json"
 verify_config_integrity() {
   local hash_file="/sandbox/.openclaw/.config-hash"
   if [ ! -f "$hash_file" ]; then
-    echo "[SECURITY] Config hash file missing — refusing to start without integrity verification"
+    echo "[SECURITY] Config hash file missing — refusing to start without integrity verification" >&2
     return 1
   fi
   if ! (cd /sandbox/.openclaw && sha256sum -c "$hash_file" --status 2>/dev/null); then
-    echo "[SECURITY] openclaw.json integrity check FAILED — config may have been tampered with"
-    echo "[SECURITY] Expected hash: $(cat "$hash_file")"
-    echo "[SECURITY] Actual hash:   $(sha256sum /sandbox/.openclaw/openclaw.json)"
+    echo "[SECURITY] openclaw.json integrity check FAILED — config may have been tampered with" >&2
+    echo "[SECURITY] Expected hash: $(cat "$hash_file")" >&2
+    echo "[SECURITY] Actual hash:   $(sha256sum /sandbox/.openclaw/openclaw.json)" >&2
     return 1
   fi
 }
@@ -330,8 +361,8 @@ PYTOKEN
     remote_url="${remote_url}#token=${token}"
   fi
 
-  echo "[gateway] Local UI: ${local_url}"
-  echo "[gateway] Remote UI: ${remote_url}"
+  echo "[gateway] Local UI: ${local_url}" >&2
+  echo "[gateway] Remote UI: ${remote_url}" >&2
 }
 
 start_auto_pair() {
@@ -352,6 +383,13 @@ OPENCLAW = os.environ.get('OPENCLAW_BIN', 'openclaw')
 DEADLINE = time.time() + 600
 QUIET_POLLS = 0
 APPROVED = 0
+HANDLED = set()  # Track rejected/approved requestIds to avoid reprocessing
+# SECURITY NOTE: clientId/clientMode are client-supplied and spoofable
+# (the gateway stores connectParams.client.id verbatim). This allowlist
+# is defense-in-depth, not a trust boundary. PR #690 adds one-shot exit,
+# timeout reduction, and token cleanup for a more comprehensive fix.
+ALLOWED_CLIENTS = {'openclaw-control-ui'}
+ALLOWED_MODES = {'webchat'}
 
 def run(*args):
     proc = subprocess.run(args, capture_output=True, text=True)
@@ -375,13 +413,22 @@ while time.time() < DEADLINE:
     if pending:
         QUIET_POLLS = 0
         for device in pending:
-            request_id = (device or {}).get('requestId')
-            if not request_id:
+            if not isinstance(device, dict):
+                continue
+            request_id = device.get('requestId')
+            if not request_id or request_id in HANDLED:
+                continue
+            client_id = device.get('clientId', '')
+            client_mode = device.get('clientMode', '')
+            if client_id not in ALLOWED_CLIENTS and client_mode not in ALLOWED_MODES:
+                HANDLED.add(request_id)
+                print(f'[auto-pair] rejected unknown client={client_id} mode={client_mode}')
                 continue
             arc, aout, aerr = run(OPENCLAW, 'devices', 'approve', request_id, '--json')
+            HANDLED.add(request_id)
             if arc == 0:
                 APPROVED += 1
-                print(f'[auto-pair] approved request={request_id}')
+                print(f'[auto-pair] approved request={request_id} client={client_id}')
             elif aout or aerr:
                 print(f'[auto-pair] approve failed request={request_id}: {(aerr or aout)[:400]}')
         time.sleep(1)
@@ -401,7 +448,7 @@ while time.time() < DEADLINE:
 else:
     print(f'[auto-pair] watcher timed out approvals={APPROVED}')
 PYAUTOPAIR
-  echo "[gateway] auto-pair watcher launched (pid $!)"
+  echo "[gateway] auto-pair watcher launched (pid $!)" >&2
 }
 
 ensure_agent_dirs() {
@@ -554,7 +601,7 @@ fi
 
 # ── Main ─────────────────────────────────────────────────────────
 
-echo 'Setting up NemoClaw...'
+echo 'Setting up NemoClaw...' >&2
 [ -f .env ] && chmod 600 .env
 openclaw doctor --fix >/dev/null 2>&1 || true
 export CHAT_UI_URL PUBLIC_PORT
@@ -570,10 +617,11 @@ openclaw plugins install /opt/nemoclaw >/dev/null 2>&1 || true
 # separation and run everything as the current user (sandbox).
 # Gateway process isolation is not available in this mode.
 if [ "$(id -u)" -ne 0 ]; then
-  echo "[gateway] Running as non-root (uid=$(id -u)) — privilege separation disabled"
+  echo "[gateway] Running as non-root (uid=$(id -u)) — privilege separation disabled" >&2
   export HOME=/sandbox
   if ! verify_config_integrity; then
-    echo "[SECURITY WARNING] Config integrity check failed — proceeding anyway (non-root mode)"
+    echo "[SECURITY] Config integrity check failed — refusing to start (non-root mode)" >&2
+    exit 1
   fi
   write_auth_profile
 
@@ -593,7 +641,7 @@ if [ "$(id -u)" -ne 0 ]; then
   # Start gateway in background, auto-pair, then wait
   nohup "$OPENCLAW" gateway run >/tmp/gateway.log 2>&1 &
   GATEWAY_PID=$!
-  echo "[gateway] openclaw gateway launched (pid $GATEWAY_PID)"
+  echo "[gateway] openclaw gateway launched (pid $GATEWAY_PID)" >&2
   start_auto_pair
   print_dashboard_urls
   wait "$GATEWAY_PID"
@@ -631,10 +679,23 @@ for entry in /sandbox/.openclaw/*; do
   target="$(readlink -f "$entry" 2>/dev/null || true)"
   expected="/sandbox/.openclaw-data/$name"
   if [ "$target" != "$expected" ]; then
-    echo "[SECURITY] Symlink $entry points to unexpected target: $target (expected $expected)"
+    echo "[SECURITY] Symlink $entry points to unexpected target: $target (expected $expected)" >&2
     exit 1
   fi
 done
+
+# Lock .openclaw directory after symlink validation: set the immutable flag
+# so symlinks cannot be swapped at runtime even if DAC or Landlock are
+# bypassed. chattr requires cap_linux_immutable which the entrypoint has
+# as root; the sandbox user cannot remove the flag.
+# Ref: https://github.com/NVIDIA/NemoClaw/issues/1019
+if command -v chattr >/dev/null 2>&1; then
+  chattr +i /sandbox/.openclaw 2>/dev/null || true
+  for entry in /sandbox/.openclaw/*; do
+    [ -L "$entry" ] || continue
+    chattr +i "$entry" 2>/dev/null || true
+  done
+fi
 
 # Start the gateway as the 'gateway' user.
 # SECURITY: The sandbox user cannot kill this process because it runs
@@ -642,7 +703,7 @@ done
 # the agent cannot restart the gateway with a tampered config.
 nohup gosu gateway env OPENCLAW_CONFIG_PATH="$OPENCLAW_CONFIG_PATH" "$OPENCLAW" gateway run >/tmp/gateway.log 2>&1 &
 GATEWAY_PID=$!
-echo "[gateway] openclaw gateway launched as 'gateway' user (pid $GATEWAY_PID)"
+echo "[gateway] openclaw gateway launched as 'gateway' user (pid $GATEWAY_PID)" >&2
 
 start_auto_pair
 print_dashboard_urls
