@@ -259,7 +259,7 @@ ollama_service_url_candidates() {
   local nameserver=""
   local gateway=""
 
-  if ollama_override_service_url > /dev/null 2>&1; then
+  if ollama_override_service_url >/dev/null 2>&1; then
     ollama_override_service_url
   fi
 
@@ -285,7 +285,7 @@ resolve_ollama_host_url() {
 
   while IFS= read -r service_url; do
     [ -n "$service_url" ] || continue
-    if curl -sf "$service_url/api/tags" > /dev/null 2>&1; then
+    if curl -sf "$service_url/api/tags" >/dev/null 2>&1; then
       printf '%s\n' "$service_url"
       return 0
     fi
@@ -300,7 +300,7 @@ resolve_ollama_route_url() {
   host_url="$(resolve_ollama_host_url || true)"
   case "$host_url" in
     http://localhost:11434) printf 'http://host.openshell.internal:11434\n' ;;
-    http://*|https://*)
+    http://* | https://*)
       if is_wsl; then
         printf 'http://host.docker.internal:11434\n'
       else
@@ -319,7 +319,7 @@ check_local_provider_health() {
       curl -sf http://localhost:8000/v1/models >/dev/null 2>&1
       ;;
     ollama-local)
-      resolve_ollama_host_url > /dev/null
+      resolve_ollama_host_url >/dev/null
       ;;
     *)
       return 1
