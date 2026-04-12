@@ -27,6 +27,8 @@ const STDERR_NOISE_PATTERNS = [
   /^\(Use `node --trace-warnings .*$/i,
   /^\[plugins\] plugins\.allow is empty; discovered non-bundled plugins may auto-load:.*$/i,
   /^nemoclaw \(\/sandbox\/\.openclaw\/extensions\/nemoclaw\/dist\/index\.js\)\. Set plugins\.allow to explicit trusted ids\..*$/i,
+  /^\[SECURITY\] CAP_SETPCAP not available — runtime already restricts capabilities$/,
+  /^\[tools\] read failed: ENOENT: no such file or directory, access '\/sandbox\/\.openclaw\/workspace\/.*'$/,
 ];
 
 const OPENSHELL = resolveOpenshell();
@@ -177,6 +179,19 @@ function normalizeAgentResponse(response, telegramToolAvailable) {
   return "Telegram delivery is available from inside the sandbox. The earlier claim that the OpenClaw Telegram tool could not send was inaccurate.";
 }
 
+async function maybeNormalizeAgentResponse(
+  response,
+  sessionId,
+  verifyFn = verifyTelegramToolAvailable,
+) {
+  if (!TELEGRAM_TOOL_FALSE_NEGATIVE_PATTERN.test(response)) {
+    return response;
+  }
+
+  const telegramToolAvailable = await verifyFn(sessionId);
+  return normalizeAgentResponse(response, telegramToolAvailable);
+}
+
 function summarizeStderr(stderr) {
   const lines = String(stderr || "")
     .split("\n")
@@ -284,12 +299,9 @@ async function poll() {
         const typingInterval = setInterval(() => sendTyping(chatId), 4000);
 
         try {
-          const [response, telegramToolAvailable] = await Promise.all([
-            runAgentInSandbox(msg.text, chatId),
-            verifyTelegramToolAvailable(chatId),
-          ]);
+          const response = await runAgentInSandbox(msg.text, chatId);
           clearInterval(typingInterval);
-          const finalResponse = normalizeAgentResponse(response, telegramToolAvailable);
+          const finalResponse = await maybeNormalizeAgentResponse(response, chatId);
           console.log(`[${chatId}] agent: ${finalResponse.slice(0, 100)}...`);
           await sendMessage(chatId, finalResponse, msg.message_id);
         } catch (err) {
@@ -340,6 +352,7 @@ module.exports = {
   buildAgentCommand,
   buildTelegramToolCheckCommand,
   formatAgentFailure,
+  maybeNormalizeAgentResponse,
   normalizeAgentResponse,
   runAgentInSandbox,
   summarizeStderr,

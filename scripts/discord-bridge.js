@@ -27,6 +27,8 @@ const STDERR_NOISE_PATTERNS = [
   /^\(Use `node --trace-warnings .*$/i,
   /^\[plugins\] plugins\.allow is empty; discovered non-bundled plugins may auto-load:.*$/i,
   /^nemoclaw \(\/sandbox\/\.openclaw\/extensions\/nemoclaw\/dist\/index\.js\)\. Set plugins\.allow to explicit trusted ids\..*$/i,
+  /^\[SECURITY\] CAP_SETPCAP not available — runtime already restricts capabilities$/,
+  /^\[tools\] read failed: ENOENT: no such file or directory, access '\/sandbox\/\.openclaw\/workspace\/.*'$/,
 ];
 const STDOUT_NOISE_PATTERNS = [
   /^\[gateway\] Running as non-root \(uid=\d+\) — privilege separation disabled$/,
@@ -211,6 +213,19 @@ function normalizeAgentResponse(response, discordToolAvailable) {
   return "Discord delivery is available from inside the sandbox. The earlier claim that the OpenClaw Discord tool could not send was inaccurate.";
 }
 
+async function maybeNormalizeAgentResponse(
+  response,
+  targetChannelId = CHANNEL_ID,
+  verifyFn = verifyDiscordToolAvailable,
+) {
+  if (!DISCORD_TOOL_FALSE_NEGATIVE_PATTERN.test(response)) {
+    return response;
+  }
+
+  const discordToolAvailable = await verifyFn(targetChannelId);
+  return normalizeAgentResponse(response, discordToolAvailable);
+}
+
 function summarizeStderr(stderr) {
   const lines = String(stderr || "")
     .split("\n")
@@ -305,12 +320,9 @@ async function handleMessage(message) {
   const typingInterval = setInterval(() => sendTyping(CHANNEL_ID), 4000);
 
   try {
-    const [response, discordToolAvailable] = await Promise.all([
-      runAgentInSandbox(message.content, message.id),
-      verifyDiscordToolAvailable(CHANNEL_ID),
-    ]);
+    const response = await runAgentInSandbox(message.content, message.id);
     clearInterval(typingInterval);
-    const finalResponse = normalizeAgentResponse(response, discordToolAvailable);
+    const finalResponse = await maybeNormalizeAgentResponse(response, CHANNEL_ID);
     console.log(`[${CHANNEL_ID}] agent: ${finalResponse.slice(0, 100)}...`);
     await sendMessage(CHANNEL_ID, finalResponse, message.id);
   } catch (error) {
@@ -376,6 +388,7 @@ module.exports = {
   formatAgentFailure,
   extractAgentResponse,
   isResponseNoiseLine,
+  maybeNormalizeAgentResponse,
   normalizeAgentResponse,
   runAgentInSandbox,
   summarizeStderr,

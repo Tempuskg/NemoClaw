@@ -118,6 +118,43 @@ describe("discord bridge", () => {
     }
   });
 
+  it("only probes Discord delivery for the known false negative response", async () => {
+    const originalToken = process.env.DISCORD_BOT_TOKEN;
+    const originalChannelId = process.env.DISCORD_CHANNEL_ID;
+    const originalApiKey = process.env.NVIDIA_API_KEY;
+
+    process.env.DISCORD_BOT_TOKEN = "token";
+    process.env.DISCORD_CHANNEL_ID = "98765";
+    process.env.NVIDIA_API_KEY = "secret";
+
+    const restoreResolve = vi
+      .spyOn(require("../bin/lib/resolve-openshell"), "resolveOpenshell")
+      .mockImplementation(() => "/usr/bin/openshell");
+    const { maybeNormalizeAgentResponse } = require("../scripts/discord-bridge.js");
+    const verifySpy = vi.fn();
+
+    try {
+      assert.equal(await maybeNormalizeAgentResponse("All good.", "98765", verifySpy), "All good.");
+      assert.equal(verifySpy.mock.calls.length, 0);
+
+      verifySpy.mockResolvedValueOnce(true);
+      const normalized = await maybeNormalizeAgentResponse(
+        "I'm still having trouble sending messages via the OpenClaw Discord tool despite the configuration we tried.",
+        "98765",
+        verifySpy,
+      );
+
+      assert.match(normalized, /Discord delivery is available from inside the sandbox/);
+      assert.equal(verifySpy.mock.calls.length, 1);
+    } finally {
+      restoreResolve.mockRestore();
+      process.env.DISCORD_BOT_TOKEN = originalToken;
+      process.env.DISCORD_CHANNEL_ID = originalChannelId;
+      process.env.NVIDIA_API_KEY = originalApiKey;
+      delete require.cache[require.resolve("../scripts/discord-bridge.js")];
+    }
+  });
+
   it("filters noisy stderr warnings from bridge failures", () => {
     const originalToken = process.env.DISCORD_BOT_TOKEN;
     const originalChannelId = process.env.DISCORD_CHANNEL_ID;
@@ -143,6 +180,40 @@ describe("discord bridge", () => {
       assert.match(formatAgentFailure(255, stderr), /Agent session failed while reaching sandbox/);
       assert.match(formatAgentFailure(255, stderr), /ssh: connect to host failed/);
       assert.doesNotMatch(formatAgentFailure(255, stderr), /UNDICI-EHPA/);
+    } finally {
+      restoreResolve.mockRestore();
+      process.env.DISCORD_BOT_TOKEN = originalToken;
+      process.env.DISCORD_CHANNEL_ID = originalChannelId;
+      process.env.NVIDIA_API_KEY = originalApiKey;
+      delete require.cache[require.resolve("../scripts/discord-bridge.js")];
+    }
+  });
+
+  it("filters non-fatal sandbox startup stderr noise from bridge failures", () => {
+    const originalToken = process.env.DISCORD_BOT_TOKEN;
+    const originalChannelId = process.env.DISCORD_CHANNEL_ID;
+    const originalApiKey = process.env.NVIDIA_API_KEY;
+
+    process.env.DISCORD_BOT_TOKEN = "token";
+    process.env.DISCORD_CHANNEL_ID = "98765";
+    process.env.NVIDIA_API_KEY = "secret";
+
+    const restoreResolve = vi
+      .spyOn(require("../bin/lib/resolve-openshell"), "resolveOpenshell")
+      .mockImplementation(() => "/usr/bin/openshell");
+    const { formatAgentFailure, summarizeStderr } = require("../scripts/discord-bridge.js");
+
+    try {
+      const stderr = [
+        "[SECURITY] CAP_SETPCAP not available — runtime already restricts capabilities",
+        "[tools] read failed: ENOENT: no such file or directory, access '/sandbox/.openclaw/workspace/SentinelEditor/app/src/main/java/com/sentinel/Navigation.kt'",
+        "ssh: connect to host failed",
+      ].join("\n");
+
+      assert.equal(summarizeStderr(stderr), "ssh: connect to host failed");
+      assert.doesNotMatch(formatAgentFailure(255, stderr), /CAP_SETPCAP/);
+      assert.doesNotMatch(formatAgentFailure(255, stderr), /Navigation\.kt/);
+      assert.match(formatAgentFailure(255, stderr), /ssh: connect to host failed/);
     } finally {
       restoreResolve.mockRestore();
       process.env.DISCORD_BOT_TOKEN = originalToken;

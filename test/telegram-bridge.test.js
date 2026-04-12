@@ -85,6 +85,40 @@ describe("telegram bridge", () => {
     }
   });
 
+  it("only probes Telegram delivery for the known false negative response", async () => {
+    const originalToken = process.env.TELEGRAM_BOT_TOKEN;
+    const originalApiKey = process.env.NVIDIA_API_KEY;
+
+    process.env.TELEGRAM_BOT_TOKEN = "token";
+    process.env.NVIDIA_API_KEY = "secret";
+
+    const restoreResolve = vi
+      .spyOn(require("../bin/lib/resolve-openshell"), "resolveOpenshell")
+      .mockImplementation(() => "/usr/bin/openshell");
+    const { maybeNormalizeAgentResponse } = require("../scripts/telegram-bridge.js");
+    const verifySpy = vi.fn();
+
+    try {
+      assert.equal(await maybeNormalizeAgentResponse("All good.", "12345", verifySpy), "All good.");
+      assert.equal(verifySpy.mock.calls.length, 0);
+
+      verifySpy.mockResolvedValueOnce(true);
+      const normalized = await maybeNormalizeAgentResponse(
+        "I'm still having trouble sending messages via the OpenClaw Telegram tool despite the configuration we tried.",
+        "12345",
+        verifySpy,
+      );
+
+      assert.match(normalized, /Telegram delivery is available from inside the sandbox/);
+      assert.equal(verifySpy.mock.calls.length, 1);
+    } finally {
+      restoreResolve.mockRestore();
+      process.env.TELEGRAM_BOT_TOKEN = originalToken;
+      process.env.NVIDIA_API_KEY = originalApiKey;
+      delete require.cache[require.resolve("../scripts/telegram-bridge.js")];
+    }
+  });
+
   it("filters noisy stderr warnings from bridge failures", () => {
     const originalToken = process.env.TELEGRAM_BOT_TOKEN;
     const originalApiKey = process.env.NVIDIA_API_KEY;
@@ -108,6 +142,37 @@ describe("telegram bridge", () => {
       assert.match(formatAgentFailure(255, stderr), /Agent session failed while reaching sandbox/);
       assert.match(formatAgentFailure(255, stderr), /ssh: connect to host failed/);
       assert.doesNotMatch(formatAgentFailure(255, stderr), /UNDICI-EHPA/);
+    } finally {
+      restoreResolve.mockRestore();
+      process.env.TELEGRAM_BOT_TOKEN = originalToken;
+      process.env.NVIDIA_API_KEY = originalApiKey;
+      delete require.cache[require.resolve("../scripts/telegram-bridge.js")];
+    }
+  });
+
+  it("filters non-fatal sandbox startup stderr noise from bridge failures", () => {
+    const originalToken = process.env.TELEGRAM_BOT_TOKEN;
+    const originalApiKey = process.env.NVIDIA_API_KEY;
+
+    process.env.TELEGRAM_BOT_TOKEN = "token";
+    process.env.NVIDIA_API_KEY = "secret";
+
+    const restoreResolve = vi
+      .spyOn(require("../bin/lib/resolve-openshell"), "resolveOpenshell")
+      .mockImplementation(() => "/usr/bin/openshell");
+    const { formatAgentFailure, summarizeStderr } = require("../scripts/telegram-bridge.js");
+
+    try {
+      const stderr = [
+        "[SECURITY] CAP_SETPCAP not available — runtime already restricts capabilities",
+        "[tools] read failed: ENOENT: no such file or directory, access '/sandbox/.openclaw/workspace/SentinelEditor/app/src/main/java/com/sentinel/Navigation.kt'",
+        "ssh: connect to host failed",
+      ].join("\n");
+
+      assert.equal(summarizeStderr(stderr), "ssh: connect to host failed");
+      assert.doesNotMatch(formatAgentFailure(255, stderr), /CAP_SETPCAP/);
+      assert.doesNotMatch(formatAgentFailure(255, stderr), /Navigation\.kt/);
+      assert.match(formatAgentFailure(255, stderr), /ssh: connect to host failed/);
     } finally {
       restoreResolve.mockRestore();
       process.env.TELEGRAM_BOT_TOKEN = originalToken;
