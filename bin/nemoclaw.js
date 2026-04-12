@@ -20,6 +20,7 @@ const {
   ensureApiKey,
   ensureGithubToken,
   getCredential,
+  saveCredential,
   isRepoPrivate,
 } = require("./lib/credentials");
 const registry = require("./lib/registry");
@@ -101,11 +102,26 @@ function hasSandboxAttachHandshakeFailure(logOutput) {
   return /handshake verification failed/i.test(stripAnsi(logOutput));
 }
 
-function getServiceSandboxEnv(listSandboxes = () => registry.listSandboxes()) {
+function getServiceSandboxEnv(
+  listSandboxes = () => registry.listSandboxes(),
+  getCredentialFn = getCredential,
+) {
   const { defaultSandbox } = listSandboxes();
   const safeName =
     defaultSandbox && /^[a-zA-Z0-9._-]+$/.test(defaultSandbox) ? defaultSandbox : null;
-  return safeName ? `SANDBOX_NAME="${safeName}" ` : "";
+  const envParts = [];
+  if (safeName) {
+    envParts.push(`SANDBOX_NAME="${safeName}"`);
+  }
+
+  const discordChannelId = String(
+    process.env.DISCORD_CHANNEL_ID || getCredentialFn("DISCORD_CHANNEL_ID") || "",
+  ).trim();
+  if (/^\d+$/.test(discordChannelId)) {
+    envParts.push(`DISCORD_CHANNEL_ID="${discordChannelId}"`);
+  }
+
+  return envParts.length > 0 ? `${envParts.join(" ")} ` : "";
 }
 
 function isOpenShellSandboxAvailable(name, runCaptureFn = runCapture) {
@@ -774,6 +790,8 @@ async function deploy(instanceName) {
   if (tgToken) envLines.push(`TELEGRAM_BOT_TOKEN=${shellQuote(tgToken)}`);
   const discordToken = getCredential("DISCORD_BOT_TOKEN");
   if (discordToken) envLines.push(`DISCORD_BOT_TOKEN=${shellQuote(discordToken)}`);
+  const discordChannelId = process.env.DISCORD_CHANNEL_ID || getCredential("DISCORD_CHANNEL_ID");
+  if (discordChannelId) envLines.push(`DISCORD_CHANNEL_ID=${shellQuote(discordChannelId)}`);
   const slackToken = getCredential("SLACK_BOT_TOKEN");
   if (slackToken) envLines.push(`SLACK_BOT_TOKEN=${shellQuote(slackToken)}`);
   const envDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-env-"));
@@ -821,6 +839,10 @@ async function deploy(instanceName) {
 
 async function start() {
   await ensureApiKey();
+  const discordChannelId = String(process.env.DISCORD_CHANNEL_ID || "").trim();
+  if (/^\d+$/.test(discordChannelId)) {
+    saveCredential("DISCORD_CHANNEL_ID", discordChannelId);
+  }
   const sandboxEnv = getServiceSandboxEnv();
   run(`${sandboxEnv}bash "${SCRIPTS}/start-services.sh"`);
 }

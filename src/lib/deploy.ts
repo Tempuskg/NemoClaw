@@ -16,6 +16,7 @@ export interface DeployCredentials {
   TELEGRAM_BOT_TOKEN?: string | null;
   ALLOWED_CHAT_IDS?: string | null;
   DISCORD_BOT_TOKEN?: string | null;
+  DISCORD_CHANNEL_ID?: string | null;
   SLACK_BOT_TOKEN?: string | null;
 }
 
@@ -141,6 +142,10 @@ export function buildDeployEnvLines(opts: {
     envLines.push(`ALLOWED_CHAT_IDS=${shellQuote(credentials.ALLOWED_CHAT_IDS)}`);
   }
 
+  if (credentials.DISCORD_BOT_TOKEN && credentials.DISCORD_CHANNEL_ID) {
+    envLines.push(`DISCORD_CHANNEL_ID=${shellQuote(credentials.DISCORD_CHANNEL_ID)}`);
+  }
+
   return envLines;
 }
 
@@ -260,6 +265,7 @@ export async function executeDeploy(opts: DeployExecutionOptions): Promise<void>
     TELEGRAM_BOT_TOKEN: getCredential("TELEGRAM_BOT_TOKEN"),
     ALLOWED_CHAT_IDS: getCredential("ALLOWED_CHAT_IDS"),
     DISCORD_BOT_TOKEN: getCredential("DISCORD_BOT_TOKEN"),
+    DISCORD_CHANNEL_ID: env.DISCORD_CHANNEL_ID || getCredential("DISCORD_CHANNEL_ID"),
     SLACK_BOT_TOKEN: getCredential("SLACK_BOT_TOKEN"),
   };
   const provider = inferDeployProvider(env.NEMOCLAW_PROVIDER, credentials);

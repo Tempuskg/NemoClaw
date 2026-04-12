@@ -92,6 +92,39 @@ describe("service environment", () => {
       assert.equal(envPrefix, 'SANDBOX_NAME="the-crucible" ');
     });
 
+    it("includes a stored Discord channel id when available", () => {
+      const originalChannelId = process.env.DISCORD_CHANNEL_ID;
+      delete process.env.DISCORD_CHANNEL_ID;
+      const envPrefix = getServiceSandboxEnv(
+        () => ({
+          sandboxes: [{ name: "the-crucible" }],
+          defaultSandbox: "the-crucible",
+        }),
+        (key) => (key === "DISCORD_CHANNEL_ID" ? "1492125480768376965" : null),
+      );
+      assert.equal(
+        envPrefix,
+        'SANDBOX_NAME="the-crucible" DISCORD_CHANNEL_ID="1492125480768376965" ',
+      );
+      if (originalChannelId === undefined) delete process.env.DISCORD_CHANNEL_ID;
+      else process.env.DISCORD_CHANNEL_ID = originalChannelId;
+    });
+
+    it("prefers DISCORD_CHANNEL_ID from the current environment over stored credentials", () => {
+      const originalChannelId = process.env.DISCORD_CHANNEL_ID;
+      process.env.DISCORD_CHANNEL_ID = "200";
+      const envPrefix = getServiceSandboxEnv(
+        () => ({
+          sandboxes: [{ name: "the-crucible" }],
+          defaultSandbox: "the-crucible",
+        }),
+        () => "1492125480768376965",
+      );
+      assert.equal(envPrefix, 'SANDBOX_NAME="the-crucible" DISCORD_CHANNEL_ID="200" ');
+      if (originalChannelId === undefined) delete process.env.DISCORD_CHANNEL_ID;
+      else process.env.DISCORD_CHANNEL_ID = originalChannelId;
+    });
+
     it("nemoclaw service commands skip invalid sandbox names", () => {
       const envPrefix = getServiceSandboxEnv(() => ({
         sandboxes: [{ name: "bad name" }],
