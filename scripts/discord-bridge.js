@@ -22,6 +22,8 @@ const { resolveOpenshell } = require("../bin/lib/resolve-openshell");
 const { shellQuote, validateName } = require("../bin/lib/runner");
 
 const DISCORD_TOOL_FALSE_NEGATIVE_PATTERN = /trouble sending messages via the openclaw discord tool/i;
+const RETRYABLE_SANDBOX_EXIT_CODES = new Set([255]);
+const SANDBOX_COMMAND_RETRY_DELAY_MS = 1000;
 const STDERR_NOISE_PATTERNS = [
   /^\(node:\d+\) \[UNDICI-EHPA\] Warning: EnvHttpProxyAgent is experimental.*$/i,
   /^\(Use `node --trace-warnings .*$/i,
@@ -202,8 +204,40 @@ function runCommandInSandbox(command, sessionId, timeoutMs = 120000) {
   });
 }
 
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function isRetryableSandboxFailure(code) {
+  return RETRYABLE_SANDBOX_EXIT_CODES.has(code);
+}
+
+async function runCommandInSandboxWithRetry(
+  command,
+  sessionId,
+  timeoutMs = 120000,
+  runFn = runCommandInSandbox,
+) {
+  const initialResult = await runFn(command, sessionId, timeoutMs);
+  if (!isRetryableSandboxFailure(initialResult.code)) {
+    return initialResult;
+  }
+
+  const summary = summarizeStderr(initialResult.stderr);
+  const detail = summary ? `: ${summary}` : "";
+  console.warn(`[bridge] sandbox transport retry for '${SANDBOX}' after exit code ${initialResult.code}${detail}`);
+  await delay(SANDBOX_COMMAND_RETRY_DELAY_MS);
+  return runFn(command, sessionId, timeoutMs);
+}
+
 async function verifyDiscordToolAvailable(targetChannelId = CHANNEL_ID) {
-  const result = await runCommandInSandbox(buildDiscordToolCheckCommand(targetChannelId), `check-${targetChannelId}`, 30000);
+  const result = await runCommandInSandboxWithRetry(
+    buildDiscordToolCheckCommand(targetChannelId),
+    `check-${targetChannelId}`,
+    30000,
+  );
   return result.code === 0 && result.stdout.includes('"channel": "discord"');
 }
 
@@ -276,7 +310,7 @@ function extractAgentResponse(stdout, code, stderr) {
 
 function runAgentInSandbox(message, sessionId) {
   return new Promise((resolve) => {
-    runCommandInSandbox(buildAgentCommand(message, sessionId), sessionId).then(({ code, stdout, stderr }) => {
+    runCommandInSandboxWithRetry(buildAgentCommand(message, sessionId), sessionId).then(({ code, stdout, stderr }) => {
       resolve(extractAgentResponse(stdout, code, stderr));
     });
   });
@@ -391,6 +425,7 @@ module.exports = {
   maybeNormalizeAgentResponse,
   normalizeAgentResponse,
   runAgentInSandbox,
+  runCommandInSandboxWithRetry,
   summarizeStderr,
   verifyDiscordToolAvailable,
 };

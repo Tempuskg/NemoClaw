@@ -180,4 +180,33 @@ describe("telegram bridge", () => {
       delete require.cache[require.resolve("../scripts/telegram-bridge.js")];
     }
   });
+
+  it("retries transient sandbox transport failures once", async () => {
+    const originalToken = process.env.TELEGRAM_BOT_TOKEN;
+    const originalApiKey = process.env.NVIDIA_API_KEY;
+
+    process.env.TELEGRAM_BOT_TOKEN = "token";
+    process.env.NVIDIA_API_KEY = "secret";
+
+    const restoreResolve = vi
+      .spyOn(require("../bin/lib/resolve-openshell"), "resolveOpenshell")
+      .mockImplementation(() => "/usr/bin/openshell");
+    const { runCommandInSandboxWithRetry } = require("../scripts/telegram-bridge.js");
+    const runFn = vi
+      .fn()
+      .mockResolvedValueOnce({ code: 255, stdout: "", stderr: "ssh: connect to host failed" })
+      .mockResolvedValueOnce({ code: 0, stdout: "ok", stderr: "" });
+
+    try {
+      const result = await runCommandInSandboxWithRetry("echo ok", "12345", 1000, runFn);
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout, "ok");
+      assert.equal(runFn.mock.calls.length, 2);
+    } finally {
+      restoreResolve.mockRestore();
+      process.env.TELEGRAM_BOT_TOKEN = originalToken;
+      process.env.NVIDIA_API_KEY = originalApiKey;
+      delete require.cache[require.resolve("../scripts/telegram-bridge.js")];
+    }
+  });
 });

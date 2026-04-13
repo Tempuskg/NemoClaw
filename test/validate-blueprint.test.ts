@@ -272,6 +272,10 @@ describe("github preset", () => {
     expect(meta?.name).toBe("github");
     const np = parsed.network_policies as Record<string, unknown> | undefined;
     expect(np && "github" in np).toBe(true);
+    const githubPolicy = np?.github as { binaries?: Array<{ path?: string }> } | undefined;
+    const binaryPaths = (githubPolicy?.binaries || []).map((entry) => entry.path);
+    expect(binaryPaths).toContain("/usr/local/bin/node");
+    expect(binaryPaths).toContain("/usr/bin/node");
   });
 });
 

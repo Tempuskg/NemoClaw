@@ -153,6 +153,12 @@ describe("policies", () => {
         expect(content).toContain("/usr/bin/node");
       }
     });
+
+    it("includes node runtimes in the github preset", () => {
+      const content = policies.loadPreset("github");
+      expect(content).toContain("/usr/local/bin/node");
+      expect(content).toContain("/usr/bin/node");
+    });
   });
 
   describe("getPresetEndpoints", () => {

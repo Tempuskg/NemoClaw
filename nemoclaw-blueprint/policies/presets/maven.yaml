@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+preset:
+  name: maven
+  description: "Android/JVM build dependency access (Google Maven, Maven Central)"
+
+network_policies:
+  maven:
+    name: maven
+    endpoints:
+      - host: dl.google.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/dl/android/maven2/**" }
+      - host: repo.maven.apache.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/maven2/**" }
+      - host: repo1.maven.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: GET, path: "/maven2/**" }
+    binaries:
+      - { path: /usr/local/bin/gradle* }
+      - { path: /usr/bin/gradle* }
+      - { path: /sandbox/.openclaw-data/tools/gradle/bin/gradle }
