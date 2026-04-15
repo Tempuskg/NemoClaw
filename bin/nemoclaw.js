@@ -92,6 +92,11 @@ function isGatewayConnected(statusOutput) {
   return /Status:\s+Connected/i.test(stripAnsi(statusOutput));
 }
 
+function isSelectedGateway(statusOutput, gatewayName = GATEWAY_NAME) {
+  const escapedGatewayName = String(gatewayName).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`Gateway:\\s+${escapedGatewayName}\\b`, "i").test(stripAnsi(statusOutput));
+}
+
 function hasGatewayConnectFailure(statusOutput) {
   return /(client error \(Connect\)|transport error|tcp connect error|Connection refused|Connection reset by peer)/i.test(
     stripAnsi(statusOutput),
@@ -198,20 +203,43 @@ function exitWithSpawnResult(result) {
   process.exit(1);
 }
 
-function waitForGatewayConnection(attempts = 15, delaySeconds = 2) {
+function selectGateway(gatewayName = GATEWAY_NAME, runFn = run) {
+  runFn(`openshell gateway select ${shellQuote(gatewayName)} 2>&1`, {
+    ignoreError: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf-8",
+  });
+  process.env.OPENSHELL_GATEWAY = gatewayName;
+}
+
+function waitForGatewayConnection(attempts = 15, delaySeconds = 2, options = {}) {
+  const runCaptureFn = options.runCapture || runCapture;
+  const spawnSyncFn = options.spawnSync || spawnSync;
+  const beforePoll = options.beforePoll || null;
+  const gatewayName = options.gatewayName || GATEWAY_NAME;
+
   for (let i = 0; i < attempts; i += 1) {
-    const status = runCapture("openshell status 2>&1", { ignoreError: true });
-    if (isGatewayConnected(status)) {
+    if (beforePoll) {
+      beforePoll(i);
+    }
+    const status = runCaptureFn("openshell status 2>&1", { ignoreError: true });
+    if (isGatewayConnected(status) && isSelectedGateway(status, gatewayName)) {
       return true;
     }
-    spawnSync("sleep", [String(delaySeconds)]);
+    if (i < attempts - 1) {
+      spawnSyncFn("sleep", [String(delaySeconds)]);
+    }
   }
   return false;
 }
 
-function resumeStoppedGateway() {
-  const containerName = getGatewayClusterContainerName();
-  const containers = runCapture("docker ps -a --format '{{.Names}}\t{{.Status}}'", {
+function resumeStoppedGateway(options = {}) {
+  const gatewayName = options.gatewayName || GATEWAY_NAME;
+  const runFn = options.run || run;
+  const runCaptureFn = options.runCapture || runCapture;
+  const spawnSyncFn = options.spawnSync || spawnSync;
+  const containerName = getGatewayClusterContainerName(gatewayName);
+  const containers = runCaptureFn("docker ps -a --format '{{.Names}}\t{{.Status}}'", {
     ignoreError: true,
   });
   const containerLine = containers
@@ -223,14 +251,19 @@ function resumeStoppedGateway() {
   }
 
   if (containerLine.includes("\tUp ")) {
-    return waitForGatewayConnection();
+    return waitForGatewayConnection(15, 2, {
+      runCapture: runCaptureFn,
+      spawnSync: spawnSyncFn,
+      gatewayName,
+      beforePoll: () => selectGateway(gatewayName, runFn),
+    });
   }
 
   if (!/(\tExited|\tCreated|\tDead)/.test(containerLine)) {
     return false;
   }
 
-  const startResult = spawnSync("docker", ["start", containerName], {
+  const startResult = spawnSyncFn("docker", ["start", containerName], {
     cwd: ROOT,
     env: process.env,
     encoding: "utf-8",
@@ -241,7 +274,12 @@ function resumeStoppedGateway() {
     return false;
   }
 
-  return waitForGatewayConnection();
+  return waitForGatewayConnection(15, 2, {
+    runCapture: runCaptureFn,
+    spawnSync: spawnSyncFn,
+    gatewayName,
+    beforePoll: () => selectGateway(gatewayName, runFn),
+  });
 }
 
 function ensureSandboxGatewayReachable() {
@@ -277,23 +315,49 @@ function ensureSandboxGatewayReachable() {
 
 function ensureSandboxGatewayForRestore(options = {}) {
   const errorFn = options.error || console.error;
-  const status = runCapture("openshell status 2>&1", { ignoreError: true });
-  if (isGatewayConnected(status)) {
+  const logFn = options.log || console.log;
+  const runFn = options.run || run;
+  const runCaptureFn = options.runCapture || runCapture;
+  const spawnSyncFn = options.spawnSync || spawnSync;
+
+  selectGateway(GATEWAY_NAME, runFn);
+  const status = runCaptureFn("openshell status 2>&1", { ignoreError: true });
+  if (isGatewayConnected(status) && isSelectedGateway(status, GATEWAY_NAME)) {
     return true;
   }
 
-  if (hasGatewayConnectFailure(status) && resumeStoppedGateway()) {
-    console.log(`  ✓ Resumed OpenShell gateway '${GATEWAY_NAME}'`);
+  if (
+    hasGatewayConnectFailure(status) &&
+    resumeStoppedGateway({
+      gatewayName: GATEWAY_NAME,
+      run: runFn,
+      runCapture: runCaptureFn,
+      spawnSync: spawnSyncFn,
+    })
+  ) {
+    logFn(`  ✓ Resumed OpenShell gateway '${GATEWAY_NAME}'`);
     return true;
   }
 
-  const startResult = run(`openshell gateway start --name ${GATEWAY_NAME} 2>&1`, {
+  const startResult = runFn(`openshell gateway start --name ${GATEWAY_NAME} 2>&1`, {
     ignoreError: true,
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf-8",
   });
-  if (startResult.status === 0 && waitForGatewayConnection()) {
-    console.log(`  ✓ Started OpenShell gateway '${GATEWAY_NAME}'`);
+
+  const startOutput = [startResult.stdout, startResult.stderr].filter(Boolean).join("\n");
+  const reusedExistingGateway = /already exists,\s*reusing/i.test(stripAnsi(startOutput));
+  if (
+    waitForGatewayConnection(15, 2, {
+      runCapture: runCaptureFn,
+      spawnSync: spawnSyncFn,
+      gatewayName: GATEWAY_NAME,
+      beforePoll: () => selectGateway(GATEWAY_NAME, runFn),
+    })
+  ) {
+    logFn(
+      `  ✓ ${reusedExistingGateway ? "Reused" : "Started"} OpenShell gateway '${GATEWAY_NAME}'`,
+    );
     return true;
   }
 
@@ -1688,6 +1752,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  ensureSandboxGatewayForRestore,
   ensureLiveSandboxForAction,
   configureSandboxFromBackupManifest,
   syncSandboxGithubTokenEnv,

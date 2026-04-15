@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { sandboxBackup, sandboxRestore, syncSandboxGithubTokenEnv } from "../bin/nemoclaw.js";
+import {
+  ensureSandboxGatewayForRestore,
+  sandboxBackup,
+  sandboxRestore,
+  syncSandboxGithubTokenEnv,
+} from "../bin/nemoclaw.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -66,6 +71,56 @@ describe("sandbox backup command", () => {
 });
 
 describe("sandbox restore command", () => {
+  it("reuses an existing named gateway when restore startup reports reuse", () => {
+    const logFn = vi.fn();
+    const errorFn = vi.fn();
+    const runFn = vi.fn().mockImplementation((command) => {
+      if (command.includes("openshell gateway start --name nemoclaw")) {
+        return {
+          status: 1,
+          stdout: "",
+          stderr: "Gateway 'nemoclaw' already exists, reusing.",
+        };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+    let statusChecks = 0;
+    const runCaptureFn = vi.fn().mockImplementation((command) => {
+      if (command.startsWith("docker ps -a")) {
+        return "";
+      }
+      if (command === "openshell status 2>&1") {
+        statusChecks += 1;
+        if (statusChecks === 1) {
+          return "Status: Disconnected\nGateway: nemoclaw\nclient error (Connect)";
+        }
+        return "Status: Connected\nGateway: nemoclaw";
+      }
+      return "";
+    });
+    const spawnSyncFn = vi.fn();
+
+    const result = ensureSandboxGatewayForRestore({
+      error: errorFn,
+      log: logFn,
+      run: runFn,
+      runCapture: runCaptureFn,
+      spawnSync: spawnSyncFn,
+    });
+
+    expect(result).toBe(true);
+    expect(logFn).toHaveBeenCalledWith("  ✓ Reused OpenShell gateway 'nemoclaw'");
+    expect(errorFn).not.toHaveBeenCalled();
+    expect(runFn).toHaveBeenCalledWith(
+      expect.stringContaining("openshell gateway select 'nemoclaw' 2>&1"),
+      expect.objectContaining({ ignoreError: true }),
+    );
+    expect(runFn).toHaveBeenCalledWith(
+      expect.stringContaining("openshell gateway start --name nemoclaw 2>&1"),
+      expect.objectContaining({ ignoreError: true }),
+    );
+  });
+
   it("recreates a missing sandbox before restoring the backup", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const ensureGateway = vi.fn();
