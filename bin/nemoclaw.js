@@ -418,10 +418,7 @@ function parseRestoreActionArgs(args) {
   return { backupId: args[0] || null };
 }
 
-function probeSandboxRestoreAccess(
-  sandboxName,
-  runSandboxScriptFn = backupStore.runSandboxScript,
-) {
+function probeSandboxRestoreAccess(sandboxName, runSandboxScriptFn = backupStore.runSandboxScript) {
   const result = runSandboxScriptFn(sandboxName, "set -eu\ntrue", { ignoreError: true });
   if (result.status === 0) {
     return { usable: true, output: "" };

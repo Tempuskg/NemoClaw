@@ -118,7 +118,9 @@ describe("onboard helpers", () => {
       "  Gateway image store is missing 'openshell/sandbox-from:1776216223' after upload. Importing it directly...",
     );
     expect(runFn).toHaveBeenCalledWith(
-      expect.stringContaining("docker save 'openshell/sandbox-from:1776216223' | docker exec -i 'openshell-cluster-nemoclaw' ctr -n k8s.io images import -"),
+      expect.stringContaining(
+        "docker save 'openshell/sandbox-from:1776216223' | docker exec -i 'openshell-cluster-nemoclaw' ctr -n k8s.io images import -",
+      ),
       expect.objectContaining({ ignoreError: true }),
     );
     expect(logFn).toHaveBeenCalledWith(
