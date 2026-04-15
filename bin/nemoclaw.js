@@ -418,6 +418,33 @@ function parseRestoreActionArgs(args) {
   return { backupId: args[0] || null };
 }
 
+function probeSandboxRestoreAccess(
+  sandboxName,
+  runSandboxScriptFn = backupStore.runSandboxScript,
+) {
+  const result = runSandboxScriptFn(sandboxName, "set -eu\ntrue", { ignoreError: true });
+  if (result.status === 0) {
+    return { usable: true, output: "" };
+  }
+
+  const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+  return { usable: false, output };
+}
+
+async function withRecreateSandboxEnabled(work) {
+  const previous = process.env.NEMOCLAW_RECREATE_SANDBOX;
+  process.env.NEMOCLAW_RECREATE_SANDBOX = "1";
+  try {
+    return await work();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.NEMOCLAW_RECREATE_SANDBOX;
+    } else {
+      process.env.NEMOCLAW_RECREATE_SANDBOX = previous;
+    }
+  }
+}
+
 function hydrateRestoreCredentialEnv(provider) {
   const credentialMap = {
     "nvidia-nim": "NVIDIA_API_KEY",
@@ -623,6 +650,7 @@ async function sandboxRestore(sandboxName, actionArgs = [], _options = {}) {
   const createSandboxFn = _options.createSandbox || createSandbox;
   const configureSandboxFn = _options.configureSandbox || configureSandboxFromBackupManifest;
   const ensureGatewayFn = _options.ensureGateway || ensureSandboxGatewayForRestore;
+  const probeSandboxAccessFn = _options.probeSandboxAccess || probeSandboxRestoreAccess;
 
   try {
     const parsed = parseRestoreActionArgs(actionArgs);
@@ -631,18 +659,40 @@ async function sandboxRestore(sandboxName, actionArgs = [], _options = {}) {
     const isLive =
       _options.isAvailable ??
       isOpenShellSandboxAvailable(sandboxName, _options.runCapture || runCapture);
+    let recreateExisting = false;
 
     if (isLive) {
-      if (!(await confirmRestoreOverwrite(promptFn, sandboxName, selectedBackup.id))) {
+      const accessProbe = probeSandboxAccessFn(sandboxName);
+      if (!accessProbe.usable) {
+        console.log("");
+        console.log(
+          `  Sandbox '${sandboxName}' exists, but restore cannot attach to it through the current gateway.`,
+        );
+        if (accessProbe.output) {
+          console.log(
+            accessProbe.output
+              .split("\n")
+              .map((line) => `    ${line}`)
+              .join("\n"),
+          );
+        }
+        console.log(
+          `  Recreating sandbox '${sandboxName}' from backup '${selectedBackup.id}' instead of reusing the current runtime.`,
+        );
+        recreateExisting = true;
+      } else if (!(await confirmRestoreOverwrite(promptFn, sandboxName, selectedBackup.id))) {
         return false;
       }
-    } else {
+    }
+
+    if (!isLive || recreateExisting) {
       await _restoreCreateSandbox(
         ensureGatewayFn,
         createSandboxFn,
         manifest,
         sandboxName,
         selectedBackup.id,
+        recreateExisting,
       );
     }
 
@@ -653,7 +703,11 @@ async function sandboxRestore(sandboxName, actionArgs = [], _options = {}) {
       selectedBackup,
       manifest,
     );
-    return { sandboxName, backupId: selectedBackup.id, recreated: !isLive };
+    return {
+      sandboxName,
+      backupId: selectedBackup.id,
+      recreated: !isLive || recreateExisting,
+    };
   } catch (error) {
     errorFn(`  ${error.message}`);
     if (exitFn) {
@@ -669,17 +723,24 @@ async function _restoreCreateSandbox(
   manifest,
   sandboxName,
   backupId,
+  recreateExisting = false,
 ) {
   ensureGatewayFn();
   console.log("");
   console.log(`  Recreating sandbox '${sandboxName}' from backup '${backupId}'...`);
-  await createSandboxFn(
-    Boolean(manifest && manifest.registry && manifest.registry.gpuEnabled),
-    null,
-    null,
-    null,
-    sandboxName,
-  );
+  const createSandboxCall = () =>
+    createSandboxFn(
+      Boolean(manifest && manifest.registry && manifest.registry.gpuEnabled),
+      null,
+      null,
+      null,
+      sandboxName,
+    );
+  if (recreateExisting) {
+    await withRecreateSandboxEnabled(createSandboxCall);
+    return;
+  }
+  await createSandboxCall();
 }
 
 async function _restoreBackupAndConfigure(

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -24,6 +24,9 @@ const {
   buildControlUiConfigSyncScript,
   buildSandboxConfigSyncScript,
   classifySandboxCreateFailure,
+  ensureGatewayHasSandboxImage,
+  extractSandboxImageRef,
+  gatewayHasSandboxImage,
   getOllamaProbeOutcome,
   getControlUiAllowedOrigins,
   getDashboardForwardPort,
@@ -68,6 +71,59 @@ describe("onboard helpers", () => {
       kind: "sandbox_create_incomplete",
       uploadedToGateway: true,
     });
+  });
+
+  it("extracts sandbox image refs from create output", () => {
+    expect(
+      extractSandboxImageRef(
+        [
+          "  Building image openshell/sandbox-from:1776216223 from /tmp/build/Dockerfile",
+          "  [progress] Uploaded to gateway",
+        ].join("\n"),
+      ),
+    ).toBe("openshell/sandbox-from:1776216223");
+    expect(extractSandboxImageRef("no image ref here")).toBe(null);
+  });
+
+  it("detects sandbox image presence in the gateway image store", () => {
+    const runCaptureFn = (command, _opts = {}) => {
+      expect(command).toContain("ctr -n k8s.io images ls");
+      return "docker.io/openshell/sandbox-from:1776216223";
+    };
+
+    expect(
+      gatewayHasSandboxImage("openshell/sandbox-from:1776216223", "nemoclaw", runCaptureFn),
+    ).toBe(true);
+  });
+
+  it("imports a missing sandbox image into the gateway image store", () => {
+    const logFn = vi.fn();
+    const warnFn = vi.fn();
+    const runFn = vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" });
+    const runCaptureFn = vi
+      .fn()
+      .mockReturnValueOnce("")
+      .mockReturnValueOnce("docker.io/openshell/sandbox-from:1776216223");
+
+    const recovered = ensureGatewayHasSandboxImage("openshell/sandbox-from:1776216223", {
+      gatewayName: "nemoclaw",
+      run: runFn,
+      runCapture: runCaptureFn,
+      log: logFn,
+      warn: warnFn,
+    });
+
+    expect(recovered).toBe(true);
+    expect(warnFn).toHaveBeenCalledWith(
+      "  Gateway image store is missing 'openshell/sandbox-from:1776216223' after upload. Importing it directly...",
+    );
+    expect(runFn).toHaveBeenCalledWith(
+      expect.stringContaining("docker save 'openshell/sandbox-from:1776216223' | docker exec -i 'openshell-cluster-nemoclaw' ctr -n k8s.io images import -"),
+      expect.objectContaining({ ignoreError: true }),
+    );
+    expect(logFn).toHaveBeenCalledWith(
+      "  ✓ Imported 'openshell/sandbox-from:1776216223' into gateway 'nemoclaw'",
+    );
   });
 
   it("treats Ollama warm-up probe failures as warnings during restore", () => {

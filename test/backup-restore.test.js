@@ -177,12 +177,63 @@ describe("sandbox restore command", () => {
     expect(printed).toContain("Restoring backup 'pre-upgrade' into sandbox 'the-crucible'");
   });
 
+  it("recreates a live sandbox when restore cannot attach through the current gateway", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const ensureGateway = vi.fn();
+    const createSandbox = vi.fn().mockResolvedValue("the-crucible");
+    const configureSandbox = vi.fn().mockResolvedValue();
+    const restoreBackup = vi.fn().mockReturnValue({});
+    const probeSandboxAccess = vi.fn().mockReturnValue({
+      usable: false,
+      output: "Error: ssh exited with status exit status: 255",
+    });
+
+    delete process.env.NEMOCLAW_RECREATE_SANDBOX;
+
+    const result = await sandboxRestore("the-crucible", ["pre-upgrade"], {
+      isAvailable: true,
+      resolveBackup: vi.fn().mockReturnValue({
+        id: "pre-upgrade",
+        path: "/tmp/backups/the-crucible/pre-upgrade",
+        manifest: {
+          registry: {
+            gpuEnabled: true,
+          },
+        },
+      }),
+      ensureGateway,
+      createSandbox,
+      configureSandbox,
+      restoreBackup,
+      probeSandboxAccess,
+      exit: null,
+    });
+
+    expect(probeSandboxAccess).toHaveBeenCalledWith("the-crucible");
+    expect(ensureGateway).toHaveBeenCalled();
+    expect(createSandbox).toHaveBeenCalledWith(true, null, null, null, "the-crucible");
+    expect(process.env.NEMOCLAW_RECREATE_SANDBOX).toBeUndefined();
+    expect(restoreBackup).toHaveBeenCalledWith(
+      "the-crucible",
+      "/tmp/backups/the-crucible/pre-upgrade",
+    );
+    expect(result).toEqual({
+      sandboxName: "the-crucible",
+      backupId: "pre-upgrade",
+      recreated: true,
+    });
+    const printed = logSpy.mock.calls.map((args) => args.join(" ")).join("\n");
+    expect(printed).toContain("restore cannot attach to it through the current gateway");
+    expect(printed).toContain("Recreating sandbox 'the-crucible' from backup 'pre-upgrade'");
+  });
+
   it("cancels restoring into a live sandbox unless explicitly confirmed", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const restoreBackup = vi.fn();
 
     const result = await sandboxRestore("the-crucible", [], {
       isAvailable: true,
+      probeSandboxAccess: vi.fn().mockReturnValue({ usable: true, output: "" }),
       prompt: vi.fn().mockResolvedValue("nope"),
       resolveBackup: vi.fn().mockReturnValue({
         id: "20260328-102030",

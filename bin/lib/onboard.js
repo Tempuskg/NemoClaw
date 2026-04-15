@@ -1096,6 +1096,58 @@ function runCaptureOpenshell(args, opts = {}) {
   return runCapture(openshellShellCommand(args), opts);
 }
 
+function extractSandboxImageRef(output = "") {
+  if (typeof output !== "string") return null;
+  const match = output.match(/openshell\/sandbox-from:[0-9]+/);
+  return match ? match[0] : null;
+}
+
+function gatewayHasSandboxImage(imageRef, gatewayName = GATEWAY_NAME, runCaptureFn = runCapture) {
+  if (!imageRef) return false;
+  const containerName = getGatewayClusterContainerName(gatewayName);
+  const output = runCaptureFn(
+    `docker exec ${shellQuote(containerName)} sh -lc ${shellQuote(
+      `ctr -n k8s.io images ls | grep -F ${shellQuote(`docker.io/${imageRef}`)} || true`,
+    )}`,
+    { ignoreError: true },
+  );
+  return String(output || "").includes(`docker.io/${imageRef}`);
+}
+
+function importSandboxImageIntoGateway(imageRef, gatewayName = GATEWAY_NAME, runFn = run) {
+  if (!imageRef) return false;
+  const containerName = getGatewayClusterContainerName(gatewayName);
+  const result = runFn(
+    `docker save ${shellQuote(imageRef)} | docker exec -i ${shellQuote(containerName)} ctr -n k8s.io images import -`,
+    { ignoreError: true, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+  );
+  return result.status === 0;
+}
+
+function ensureGatewayHasSandboxImage(imageRef, options = {}) {
+  const gatewayName = options.gatewayName || GATEWAY_NAME;
+  const runFn = options.run || run;
+  const runCaptureFn = options.runCapture || runCapture;
+  const logFn = options.log || console.log;
+  const warnFn = options.warn || console.warn;
+
+  if (!imageRef) return false;
+  if (gatewayHasSandboxImage(imageRef, gatewayName, runCaptureFn)) {
+    return true;
+  }
+
+  warnFn(`  Gateway image store is missing '${imageRef}' after upload. Importing it directly...`);
+  if (!importSandboxImageIntoGateway(imageRef, gatewayName, runFn)) {
+    return false;
+  }
+  if (!gatewayHasSandboxImage(imageRef, gatewayName, runCaptureFn)) {
+    return false;
+  }
+
+  logFn(`  ✓ Imported '${imageRef}' into gateway '${gatewayName}'`);
+  return true;
+}
+
 function getInstalledOpenshellVersion() {
   const output = runCaptureOpenshell(["--version"], { ignoreError: true });
   if (!output) return null;
@@ -1604,19 +1656,41 @@ async function createSandbox(
   );
   const createCommand = `openshell sandbox create ${createArgs.join(" ")} -- env CHAT_UI_URL=${shellQuote(chatUiUrl)} bash -lc ${backgroundStart} 2>&1`;
   const createResult = await streamSandboxCreate(createCommand, sandboxEnv, { ignoreError: true });
+  const createFailure = classifySandboxCreateFailure(createResult.output);
+  const imageRef = extractSandboxImageRef(createResult.output);
+  const createdSandbox = /Created sandbox:/i.test(createResult.output);
+  const recoveredUploadedImage =
+    createFailure.uploadedToGateway &&
+    createdSandbox &&
+    imageRef &&
+    ensureGatewayHasSandboxImage(imageRef, { gatewayName: GATEWAY_NAME });
   // Clean up build context regardless of outcome
   run(`rm -rf "${buildCtx}"`, { ignoreError: true });
 
   if (createResult.status !== 0) {
-    console.error("");
-    console.error(`  Sandbox creation failed (exit ${createResult.status}).`);
-    if (createResult.output) {
+    if (createdSandbox) {
+      console.warn("");
+      console.warn(
+        `  Create stream exited with code ${createResult.status} after sandbox was created.`,
+      );
+      if (recoveredUploadedImage) {
+        console.warn(
+          "  Recovered missing gateway image import. Checking whether the sandbox reaches Ready state...",
+        );
+      } else {
+        console.warn("  Checking whether the sandbox reaches Ready state...");
+      }
+    } else {
       console.error("");
-      console.error(createResult.output);
+      console.error(`  Sandbox creation failed (exit ${createResult.status}).`);
+      if (createResult.output) {
+        console.error("");
+        console.error(createResult.output);
+      }
+      console.error("  Try:  openshell sandbox list        # check gateway state");
+      printSandboxCreateRecoveryHints(createResult.output);
+      process.exit(createResult.status || 1);
     }
-    console.error("  Try:  openshell sandbox list        # check gateway state");
-    printSandboxCreateRecoveryHints(createResult.output);
-    process.exit(createResult.status || 1);
   }
 
   // Wait for sandbox to reach Ready state in k3s before registering.
@@ -1625,7 +1699,8 @@ async function createSandbox(
   // causes "sandbox not found" on every subsequent connect/status call.
   console.log("  Waiting for sandbox to become ready...");
   let ready = false;
-  for (let i = 0; i < 30; i++) {
+  const readyAttempts = recoveredUploadedImage ? 90 : 30;
+  for (let i = 0; i < readyAttempts; i++) {
     const list = runCaptureOpenshell(["sandbox", "list"], { ignoreError: true });
     if (isSandboxReady(list, sandboxName)) {
       ready = true;
@@ -2665,6 +2740,9 @@ module.exports = {
   classifySandboxCreateFailure,
   countListedSandboxes,
   createSandbox,
+  ensureGatewayHasSandboxImage,
+  extractSandboxImageRef,
+  gatewayHasSandboxImage,
   getControlUiAllowedOrigins,
   getDashboardForwardPort,
   getDashboardForwardStartCommand,
